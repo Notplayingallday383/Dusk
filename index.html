@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DuskJS REPL</title>
+    <style>
+      body { font-family: monospace; margin: 1rem; background: #111; color: #eee; }
+      #out { white-space: pre-wrap; min-height: 50vh; border: 1px solid #333; padding: 0.5rem; overflow-y: auto; }
+      #line { width: 100%; box-sizing: border-box; font-family: monospace; margin-top: 0.5rem; padding: 0.4rem; background: #000; color: #eee; border: 1px solid #333; }
+      #examples button { font-family: monospace; margin: 0.2rem 0.2rem 0 0; cursor: pointer; }
+      #fspanel { margin-top: 1rem; }
+      #fsview { white-space: pre-wrap; border: 1px solid #333; padding: 0.5rem; min-height: 8rem; background: #000; overflow-y: auto; }
+      #clearfs { font-family: monospace; margin-bottom: 0.4rem; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h3>DuskJS Node REPL</h3>
+    <pre id="out"></pre>
+    <input id="line" placeholder="type JS and press Enter" autofocus />
+    <div id="examples"></div>
+    <div id="fspanel">
+      <h4>OPFS browser (persistent)</h4>
+      <button id="clearfs">Clear FS</button>
+      <pre id="fsview"></pre>
+    </div>
+    <script type="module" src="/src/index.ts"></script>
+  </body>
+</html>
