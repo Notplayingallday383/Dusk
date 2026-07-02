@@ -12,16 +12,18 @@ let valueTyped: Uint8Array | undefined;
 let js: string | undefined;
 let wasmUrl: string | undefined;
 let args: string[] | undefined;
+let preCompiledModule: WebAssembly.Module | undefined;
 
 const ready = new Promise<void>((resolve) => {
   self.addEventListener('message', (e: MessageEvent) => {
-    const d = e.data as Partial<BufferInit> & { wasmUrl?: string; args?: string[] };
-    if (!lengthTyped && d.lengthBuffer && d.valueBuffer && d.wasmUrl && d.args) {
+    const d = e.data as Partial<BufferInit> & { wasmUrl?: string; args?: string[]; wasmModule?: WebAssembly.Module };
+    if (!lengthTyped && d.lengthBuffer && d.valueBuffer && d.args) {
       lengthTyped = new Int32Array(d.lengthBuffer);
       valueTyped = new Uint8Array(d.valueBuffer);
       js = d.js;
       wasmUrl = d.wasmUrl;
       args = d.args;
+      preCompiledModule = d.wasmModule;
       resolve();
     }
   });
@@ -29,10 +31,12 @@ const ready = new Promise<void>((resolve) => {
 
 const start = async (): Promise<void> => {
   await ready;
-  if (!lengthTyped || !valueTyped || js === undefined || !wasmUrl || !args)
+  if (!lengthTyped || !valueTyped || js === undefined || !args)
     throw new Error('worker not initialized');
+  if (!preCompiledModule && !wasmUrl)
+    throw new Error('worker requires either preCompiledModule or wasmUrl');
 
-  const wasmModule = await WebAssembly.compileStreaming(fetch(wasmUrl));
+  const wasmModule = preCompiledModule ?? (await WebAssembly.compileStreaming(fetch(wasmUrl!)));
   const wasmFs = new WasmFs();
   const randomFillSync = <T>(buffer: T, offset = 0, size?: number): T => {
     const view = buffer as unknown as ArrayBufferView;

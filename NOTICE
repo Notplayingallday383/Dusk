@@ -1,0 +1,33 @@
+DuskJS
+======
+
+DuskJS bundles third-party software subject to the licenses noted below.
+
+--------------------------------------------------------------------------------
+
+just-bash (vendored source copy)
+Copyright 2024 Vercel Labs
+License: Apache License 2.0
+Source: https://github.com/vercel-labs/just-bash
+Vendored at: DuskJS/src/vendor/just-bash
+Used by:     DuskJS/src/binaries/jsh (the /bin/jsh binary)
+
+DuskJS ships a fork of the just-bash source under `src/vendor/just-bash/`.
+The vendored copy provides ~70 shell command implementations (grep, sed,
+awk, find, sort, uniq, cut, cp, mv, jq, printf, tee, base64, xargs, and
+many more) plus a POSIX-compatible shell parser and interpreter.
+DuskJS wraps this in a `/bin/jsh` binary that runs each invocation with an
+in-memory filesystem preloaded from DuskJS's own filesystem.
+
+DuskJS-specific modifications to the vendored copy:
+  - Removed: python3, sqlite3, curl (need host bridges not yet wired)
+  - Removed: gzip/gunzip/zcat, tar, xan, html-to-markdown (heavy deps)
+  - Replaced: js-exec now shells out to DuskJS's /bin/node (see
+    src/vendor/just-bash/commands/js-exec/js-exec.ts)
+  - Removed: overlay-fs and read-write-fs backends (use node:fs)
+  - All source files carry `// @ts-nocheck` because DuskJS's tsconfig
+    has stricter settings than upstream
+
+The full Apache 2.0 license text is at:
+  https://www.apache.org/licenses/LICENSE-2.0
+and in DuskJS/src/vendor/just-bash/LICENSE

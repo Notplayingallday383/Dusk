@@ -1,13 +1,35 @@
-import type { DuskRunner } from '../host/runner';
-
 export interface DuskRepl {
   feed(line: string): Promise<void>;
 }
+
+export interface ReplEngine {
+  run(js: string): Promise<void>;
+}
+
+const hasTopLevelSemicolon = (src: string): boolean => {
+  const t = src.replace(/;\s*$/, '');
+  let depth = 0;
+  let inStr: string | null = null;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i]!;
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ';' && depth === 0) return true;
+  }
+  return false;
+};
 
 const isExpression = (src: string): boolean => {
   const t = src.trim();
   if (/^\s*(const|let|var|function|class|if|for|while|switch|return|throw|try|do|import|export)\b/.test(t)) return false;
   if (/^\s*\{/.test(t)) return false;
+  if (hasTopLevelSemicolon(t)) return false;
   return true;
 };
 
@@ -29,25 +51,6 @@ const splitLeadingInit = (rhs: string): { init: string; rest: string } => {
   return { init: rhs, rest: '' };
 };
 
-const hasTopLevelSemicolon = (src: string): boolean => {
-  const t = src.replace(/;\s*$/, '');
-  let depth = 0;
-  let inStr: string | null = null;
-  for (let i = 0; i < t.length; i++) {
-    const c = t[i]!;
-    if (inStr) {
-      if (c === '\\') { i++; continue; }
-      if (c === inStr) inStr = null;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
-    if (c === '(' || c === '[' || c === '{') depth++;
-    else if (c === ')' || c === ']' || c === '}') depth--;
-    else if (c === ';' && depth === 0) return true;
-  }
-  return false;
-};
-
 const persistDeclaration = (
   src: string,
 ): { decl: string; rest: string; multi: boolean } | null => {
@@ -62,7 +65,7 @@ const persistDeclaration = (
   return { decl, rest: trimmedRest, multi: hasTopLevelSemicolon(trimmedRest) };
 };
 
-export const startRepl = (runner: DuskRunner, write: (text: string) => void): DuskRepl => {
+export const startRepl = (runner: ReplEngine, write: (text: string) => void): DuskRepl => {
   return {
     feed: async (line: string): Promise<void> => {
       const trimmed = line.trim();

@@ -14,10 +14,13 @@
     </style>
   </head>
   <body>
-    <h3>DuskJS Node REPL</h3>
+    <h3>DuskJS Shell</h3>
     <pre id="out"></pre>
-    <input id="line" placeholder="type JS and press Enter" autofocus />
+    <input id="line" placeholder="type a shell command and press Enter" autofocus />
+    <h4>Shell examples</h4>
     <div id="examples"></div>
+    <h4>Node REPL examples <small style="font-weight:normal;color:#888;">— run `node` first to enter the REPL, then click these. `.exit` returns to jsh.</small></h4>
+    <div id="node-examples"></div>
     <div id="fspanel">
       <h4>OPFS browser (persistent)</h4>
       <button id="clearfs">Clear FS</button>

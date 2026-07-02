@@ -1,3 +1,7 @@
 .debug/
 node_modules/
 dist/
+.VSCodeCounter/
+.vitest-attachments/
+package-lock.json
+test/__screenshots__/

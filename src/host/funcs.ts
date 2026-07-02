@@ -36,12 +36,18 @@ const resolveModule = async (fs: FSBackend, request: string, fromDir: string): P
 
 export const createFuncs = (fs: FSBackend, out: (text: string) => void): FuncTable => {
   const ok = (send: SendFn, value: unknown): void => send({ value });
-  const err = (send: SendFn, e: unknown): void => send({ error: String(e) });
+  const err = (send: SendFn, e: unknown): void => send({ error: e instanceof Error ? (e.stack ?? e.message) : String(e) });
 
   return {
     'console.log': (msg, send) => { out(((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n'); send({}); },
     'console.error': (msg, send) => { out(((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n'); send({}); },
     'process.cwd': (_m, send) => ok(send, '/'),
+    'process.exit': (_m, send) => { send({}); },
+    'proc.write': (m, send) => {
+      const data = m['data'] as number[] | undefined;
+      if (data) out(new TextDecoder().decode(new Uint8Array(data)));
+      send({});
+    },
     'fs.readFile': (m, send) => { void (async () => { try { ok(send, await fs.readFile(m['path'] as string)); } catch (e) { err(send, e); } })(); },
     'fs.writeFile': (m, send) => { void (async () => { try { await fs.writeFile(m['path'] as string, m['data'] as string); ok(send, true); } catch (e) { err(send, e); } })(); },
     'fs.readdir': (m, send) => { void (async () => { try { ok(send, await fs.readdir(m['path'] as string)); } catch (e) { err(send, e); } })(); },

@@ -1,5 +1,31 @@
 import { nodeFs } from './node-fs';
 import { nodePath } from './node-path';
+import { nodeChildProcess } from './node-child-process';
+import { nodeEvents } from './node-events';
+import { nodeBuffer } from './node-buffer';
+import { nodeProcess } from './node-process';
+import { nodeOs } from './node-os';
+import { nodeUtil } from './node-util';
+import { nodeCrypto } from './node-crypto';
+import { nodeUrl } from './node-url';
+import { nodeQuerystring } from './node-querystring';
+import { nodeStringDecoder } from './node-string-decoder';
+import { nodeAssert } from './node-assert';
+import { nodeTimers, nodeTimersPromises } from './node-timers';
+import { nodeAsyncHooks } from './node-async-hooks';
+import { nodeStream } from './node-stream';
+import { nodeDns } from './node-dns';
+import { nodeNet } from './node-net';
+import { nodeHttp } from './node-http';
+import { nodeZlib } from './node-zlib';
+import { nodeConsole } from './node-console';
+import { nodePerfHooks } from './node-perf-hooks';
+import { nodeTty } from './node-tty';
+import { nodeVm } from './node-vm';
+import { nodeReadline } from './node-readline';
+import { nodeRepl } from './node-repl';
+import { nodeCluster } from './node-cluster';
+import { nodeWorkerThreads } from './node-worker-threads';
 
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 
@@ -44,6 +70,64 @@ export const installESM = (): void => {
     'fs': builtinNs(nodeFs as unknown as Record<string, unknown>),
     'node:path': builtinNs(nodePath as unknown as Record<string, unknown>),
     'path': builtinNs(nodePath as unknown as Record<string, unknown>),
+    'node:child_process': builtinNs(nodeChildProcess),
+    'child_process': builtinNs(nodeChildProcess),
+    'node:events': builtinNs(nodeEvents as unknown as Record<string, unknown>),
+    'events': builtinNs(nodeEvents as unknown as Record<string, unknown>),
+    'node:buffer': builtinNs(nodeBuffer as unknown as Record<string, unknown>),
+    'buffer': builtinNs(nodeBuffer as unknown as Record<string, unknown>),
+    'node:process': builtinNs(nodeProcess as unknown as Record<string, unknown>),
+    'process': builtinNs(nodeProcess as unknown as Record<string, unknown>),
+    'node:os': builtinNs(nodeOs as unknown as Record<string, unknown>),
+    'os': builtinNs(nodeOs as unknown as Record<string, unknown>),
+    'node:util': builtinNs(nodeUtil as unknown as Record<string, unknown>),
+    'util': builtinNs(nodeUtil as unknown as Record<string, unknown>),
+    'node:crypto': builtinNs(nodeCrypto as unknown as Record<string, unknown>),
+    'crypto': builtinNs(nodeCrypto as unknown as Record<string, unknown>),
+    'node:url': builtinNs(nodeUrl as unknown as Record<string, unknown>),
+    'url': builtinNs(nodeUrl as unknown as Record<string, unknown>),
+    'node:querystring': builtinNs(nodeQuerystring as unknown as Record<string, unknown>),
+    'querystring': builtinNs(nodeQuerystring as unknown as Record<string, unknown>),
+    'node:string_decoder': builtinNs(nodeStringDecoder as unknown as Record<string, unknown>),
+    'string_decoder': builtinNs(nodeStringDecoder as unknown as Record<string, unknown>),
+    'node:assert': builtinNs(nodeAssert as unknown as Record<string, unknown>),
+    'assert': builtinNs(nodeAssert as unknown as Record<string, unknown>),
+    'node:timers': builtinNs(nodeTimers as unknown as Record<string, unknown>),
+    'timers': builtinNs(nodeTimers as unknown as Record<string, unknown>),
+    'node:timers/promises': builtinNs(nodeTimersPromises as unknown as Record<string, unknown>),
+    'timers/promises': builtinNs(nodeTimersPromises as unknown as Record<string, unknown>),
+    'node:async_hooks': builtinNs(nodeAsyncHooks as unknown as Record<string, unknown>),
+    'async_hooks': builtinNs(nodeAsyncHooks as unknown as Record<string, unknown>),
+    'node:stream': builtinNs(nodeStream as unknown as Record<string, unknown>),
+    'stream': builtinNs(nodeStream as unknown as Record<string, unknown>),
+    'node:dns': builtinNs(nodeDns as unknown as Record<string, unknown>),
+    'dns': builtinNs(nodeDns as unknown as Record<string, unknown>),
+    'node:net': builtinNs(nodeNet as unknown as Record<string, unknown>),
+    'net': builtinNs(nodeNet as unknown as Record<string, unknown>),
+    'node:http': builtinNs(nodeHttp as unknown as Record<string, unknown>),
+    'http': builtinNs(nodeHttp as unknown as Record<string, unknown>),
+    'node:https': builtinNs(nodeHttp as unknown as Record<string, unknown>),
+    'https': builtinNs(nodeHttp as unknown as Record<string, unknown>),
+    'node:zlib': builtinNs(nodeZlib as unknown as Record<string, unknown>),
+    'zlib': builtinNs(nodeZlib as unknown as Record<string, unknown>),
+    'node:console': builtinNs(nodeConsole as unknown as Record<string, unknown>),
+    'console': builtinNs(nodeConsole as unknown as Record<string, unknown>),
+    'node:perf_hooks': builtinNs(nodePerfHooks as unknown as Record<string, unknown>),
+    'perf_hooks': builtinNs(nodePerfHooks as unknown as Record<string, unknown>),
+    'node:tty': builtinNs(nodeTty as unknown as Record<string, unknown>),
+    'tty': builtinNs(nodeTty as unknown as Record<string, unknown>),
+    'node:vm': builtinNs(nodeVm as unknown as Record<string, unknown>),
+    'vm': builtinNs(nodeVm as unknown as Record<string, unknown>),
+    'node:readline': builtinNs(nodeReadline as unknown as Record<string, unknown>),
+    'readline': builtinNs(nodeReadline as unknown as Record<string, unknown>),
+    'node:repl': builtinNs(nodeRepl as unknown as Record<string, unknown>),
+    'repl': builtinNs(nodeRepl as unknown as Record<string, unknown>),
+    'node:cluster': builtinNs(nodeCluster as unknown as Record<string, unknown>),
+    'cluster': builtinNs(nodeCluster as unknown as Record<string, unknown>),
+    'node:worker_threads': builtinNs(nodeWorkerThreads as unknown as Record<string, unknown>),
+    'worker_threads': builtinNs(nodeWorkerThreads as unknown as Record<string, unknown>),
+    'node:fs/promises': builtinNs((nodeFs as { promises: Record<string, unknown> }).promises),
+    'fs/promises': builtinNs((nodeFs as { promises: Record<string, unknown> }).promises),
   };
 
   const importModule = (request: string, fromDir: string): Record<string, unknown> => {

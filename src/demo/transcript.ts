@@ -14,6 +14,18 @@ export const TRANSCRIPT_LINES: string[] = [
   'await fs.promises.readFile("/demo/hello.txt")',
   'path.resolve("/demo", "..", "demo", "./hello.txt")',
   'fetch("https://example.com").then(r => r.text()).then(t => t.length)',
+  'process.pid',
+  'process.cwd()',
+  'process.env.PATH = "/bin"; process.env.PATH',
+  'const cp = require("node:child_process")',
+  'cp.spawnSync("/bin/echo", ["hello", "from", "spawn"]).stdout',
+  'cp.spawnSync("/bin/sh", ["-c", "echo hi && echo bye"]).stdout',
+  'cp.spawnSync("/bin/sh", ["-c", "echo $0 $1 $2", "a", "b", "c"]).stdout',
+  'cp.spawnSync("/bin/sh", ["-c", "true && /bin/echo ok || /bin/echo fail"]).stdout',
+  'cp.spawnSync("/bin/pwd", [], { cwd: "/demo" }).stdout',
+  'cp.execSync("/bin/echo piped | /bin/cat")',
+  'await new Promise((res) => cp.exec("echo from exec", (e, out) => res(out)))',
+  'const child = cp.spawn("/bin/sh", ["-c", "echo streamed"]); await new Promise((r) => child.on("exit", r)); child.stdout',
 ];
 
 export const TRANSCRIPT_SEED: Record<string, string> = {

@@ -10,6 +10,8 @@
     "exactOptionalPropertyTypes": true,
     "noImplicitOverride": true,
     "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
     "skipLibCheck": true,
     "types": ["vite/client"],
     "paths": {
@@ -18,5 +20,5 @@
     "outDir": "dist"
   },
   "include": ["src", "test", "vite.config.ts", "vitest.config.ts"],
-  "exclude": ["reference", "node_modules", "dist"]
+  "exclude": ["reference", "node_modules", "dist", "src/vendor"]
 }

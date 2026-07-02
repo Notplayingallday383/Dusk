@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import { worldSource } from './vite-world-source';
+import pkg from './package.json';
 
 const crossOriginIsolation = {
   name: 'cross-origin-isolation',
@@ -16,4 +17,8 @@ export default defineConfig({
   plugins: [crossOriginIsolation, worldSource()],
   worker: { format: 'es' },
   optimizeDeps: { exclude: ['libcurl.js'] },
+  server: { allowedHosts: ['ddxdevtemp.ampscat.dev'] },
+  define: {
+    __DUSK_VERSION__: JSON.stringify(pkg.version),
+  },
 });

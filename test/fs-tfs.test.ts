@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from 'vitest';
+import { test, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { createTfsBackend, createMemoryBackend } from '../src/host/fs-backend';
 
 const clearOpfs = async (): Promise<void> => {
@@ -8,6 +8,21 @@ const clearOpfs = async (): Promise<void> => {
     await root.removeEntry(name, { recursive: true }).catch(() => {});
   }
 };
+
+const isTfsVendorJsonError = (reason: unknown): boolean => {
+  if (!(reason instanceof Error)) return false;
+  if (reason.name !== 'SyntaxError') return false;
+  if (!reason.message.includes('JSON')) return false;
+  const stack = reason.stack ?? '';
+  return stack.includes('@terbiumos/tfs');
+};
+
+const swallowTfsVendorRejection = (event: PromiseRejectionEvent): void => {
+  if (isTfsVendorJsonError(event.reason)) event.preventDefault();
+};
+
+beforeAll(() => { window.addEventListener('unhandledrejection', swallowTfsVendorRejection); });
+afterAll(() => { window.removeEventListener('unhandledrejection', swallowTfsVendorRejection); });
 
 beforeEach(clearOpfs);
 afterEach(clearOpfs);
