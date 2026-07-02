@@ -56,9 +56,12 @@ test('/bin/sh spawned with no args prints prompt and executes lines from stdin',
 test('/bin/sh interactive mode: cd persists across commands', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  // /bin/sh now points to dsh, which prompts with "dsh$ " (not "$ ").
+  // Spawn with a PTY so dsh's cooked-mode reader works.
   const sh = await repl.processManager.spawn('/bin/sh', [], {
     cwd: '/',
     env: { PATH: '/bin' },
+    pty: { cols: 80, rows: 24 },
   });
 
   const decoder = new TextDecoder();
@@ -83,7 +86,7 @@ test('/bin/sh interactive mode: cd persists across commands', async () => {
     return collected.indexOf(marker) !== -1;
   };
 
-  await waitFor('$ ');
+  await waitFor('dsh$ ');
   const encoder = new TextEncoder();
   await sh.stdin.write(encoder.encode('cd /tmp\n'));
   await sh.stdin.write(encoder.encode('pwd\n'));

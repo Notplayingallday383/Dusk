@@ -8,7 +8,7 @@ import pkg from './package.json';
 // runtime-throwing shims so the bundle links but calling those specific
 // commands surfaces a clear error message.
 // URLs constructed against import.meta.url so this works under bundler + ESM.
-const shimUrl = (name: string): string => new URL('./src/binaries/jsh/shims/' + name, import.meta.url).pathname;
+const shimUrl = (name: string): string => new URL('./src/binaries/dsh/shims/' + name, import.meta.url).pathname;
 const ENGINE_ALIASES: Record<string, string> = {
   'node:zlib': shimUrl('zlib-stub.js'),
   'node:dns': shimUrl('dns-stub.js'),

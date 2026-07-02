@@ -23,9 +23,9 @@ export const BUILTIN_BINARIES: Record<string, string> = {
   '/bin/clear': 'process.stdout.write("\\x1b[2J\\x1b[H");',
 };
 
-// Just-bash commands: thin wrappers that shell out to /bin/jsh so users can
+// Just-bash commands: thin wrappers that shell out to /bin/dsh so users can
 // invoke `grep`, `sed`, `awk`, etc. directly at a shell prompt without the
-// `jsh -c "..."` incantation. Each wrapper does spawnSync('/bin/jsh', ['-c', name + args], {stdin}) and forwards status/stdout/stderr.
+// `dsh -c "..."` incantation. Each wrapper does spawnSync('/bin/dsh', ['-c', name + args], {stdin}) and forwards status/stdout/stderr.
 const JSH_COMMANDS = [
   // Text processing
   'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'sort', 'uniq', 'cut', 'paste',
@@ -35,14 +35,14 @@ const JSH_COMMANDS = [
   'cp', 'mv', 'find', 'xargs', 'chmod', 'ln', 'du', 'stat', 'readlink', 'rmdir',
   // Data formats / hashing
   'jq', 'yq', 'base64', 'md5sum', 'printf', 'expr', 'date', 'file', 'which', 'tree',
-  // JS execution (routes to /bin/node inside jsh)
+  // JS execution (routes to /bin/node inside dsh)
   'js-exec', 'js',
   // Utils
   'head', 'tail', 'wc', 'seq', 'sleep', 'basename', 'dirname', 'timeout',
 ];
 
 // The wrapper source: read argv (excluding argv[0]), quote each arg for shell,
-// then invoke `/bin/jsh -c 'name arg1 arg2 ...'`. Forward stdin bytes as
+// then invoke `/bin/dsh -c 'name arg1 arg2 ...'`. Forward stdin bytes as
 // process.stdin content so pipelines work.
 const buildJshWrapper = (cmdName: string): string => {
   return "(function(){\n"
@@ -69,7 +69,7 @@ const buildJshWrapper = (cmdName: string): string => {
     + "  var cp = require('node:child_process');\n"
     + "  var opts = { cwd: process.cwd() };\n"
     + "  if (stdinBytes.length > 0) opts.stdin = new Uint8Array(stdinBytes);\n"
-    + "  var r = cp.spawnSync('/bin/jsh', ['-c', script], opts);\n"
+    + "  var r = cp.spawnSync('/bin/dsh', ['-c', script], opts);\n"
     + "  if (r.stdout && r.stdout.length) process.stdout.write(r.stdout);\n"
     + "  if (r.stderr && r.stderr.length) process.stderr.write(r.stderr);\n"
     + "  process.exit(r.status || 0);\n"

@@ -2,6 +2,8 @@ import { ProcessManager, type DuskProcessHandle } from './host/process-manager';
 import { createNet, type LibCurl } from './host/net';
 import { createMemoryBackend, createTfsBackend, type FSBackend } from './host/fs-backend';
 import { createLayoutBackend } from './host/fs-layout';
+import { createSqliteFuncs } from './host/sqlite';
+import { createPythonFuncs } from './host/python';
 import { startRepl, type DuskRepl } from './repl/repl';
 import type { EngineInstance, FuncTable } from './host/engine-instance';
 
@@ -68,6 +70,9 @@ export const bootRepl = async (
 
   let backend: FSBackend;
   let pm: ProcessManager;
+  // sqlite/python bridges get the same FSBackend the process manager sees.
+  // We build them AFTER pm construction (see below) once `backend` is bound.
+  let extraFuncs: FuncTable = {};
   if (useLayout) {
     const ephemeral = createMemoryBackend();
     // Build pm with persistent first (so binaries get registered), then swap to layout
@@ -84,6 +89,13 @@ export const bootRepl = async (
     backend = persistent;
     pm = new ProcessManager(backend, netFuncs);
   }
+  // Register sqlite and python IPC bridges against the effective backend.
+  // Merge into the pm's netFuncs bag so all subsequent spawns see them.
+  extraFuncs = { ...createSqliteFuncs(backend), ...createPythonFuncs(backend) };
+  (pm as unknown as { netFuncs: FuncTable }).netFuncs = {
+    ...(pm as unknown as { netFuncs: FuncTable }).netFuncs,
+    ...extraFuncs,
+  };
 
   for (const [path, contents] of Object.entries(options?.seed ?? {})) {
     const segs = path.split('/').filter(Boolean);

@@ -6,7 +6,7 @@ import type { LibCurl } from '../host/net';
 const loadRealLibcurl = async (): Promise<LibCurl> =>
   (await import('libcurl.js/bundled')).libcurl as unknown as LibCurl;
 
-// Example commands the user can click to try. All run inside jsh (backed by
+// Example commands the user can click to try. All run inside dsh (backed by
 // the vendored just-bash), which gives us grep/sed/awk/jq/find/sort/etc. plus
 // a POSIX-ish shell parser with pipelines, redirects, and variables.
 const SHELL_EXAMPLES: string[] = [
@@ -62,9 +62,58 @@ const NODE_EXAMPLES: string[] = [
   // `function fib(...)` (would scope to the eval frame).
   'fib = (n) => n < 2 ? n : fib(n - 1) + fib(n - 2)',
   'fib(10)',
-  // Meta: reset context, then exit back to jsh
+  // Meta: reset context, then exit back to dsh
   '.clear',
   '.exit',
+];
+
+// sqlite3 (dsh built-in via sql.js on the host). Each entry runs as a
+// standalone dsh command — sqlite3 exits after each invocation, so state
+// only persists across calls if you write to a TFS path (not :memory:).
+const SQLITE_EXAMPLES: string[] = [
+  // Simple arithmetic
+  'sqlite3 :memory: "SELECT 2 + 2"',
+  // Column headers + type coercion
+  'sqlite3 -header :memory: "SELECT 1 AS id, \'alice\' AS name"',
+  // JSON output
+  'sqlite3 -json :memory: "SELECT 42 AS x, \'y\' AS s"',
+  // Create a persistent DB file in TFS
+  'sqlite3 /tmp/demo.db "CREATE TABLE IF NOT EXISTS t(id INTEGER, name TEXT)"',
+  'sqlite3 /tmp/demo.db "INSERT INTO t VALUES (1,\'dusk\'),(2,\'shell\')"',
+  'sqlite3 -header -column /tmp/demo.db "SELECT * FROM t"',
+  // Cross-tool: same DB via /bin/sqlite3 REPL (once you open it, dsh is bypassed)
+  // No REPL button here — the sqlite3 command in dsh is one-shot only.
+  // Aggregation
+  'sqlite3 /tmp/demo.db "SELECT COUNT(*) AS n FROM t"',
+  // Piped SQL via stdin
+  'echo "SELECT sqlite_version()" | sqlite3 :memory:',
+];
+
+// python3 (dsh built-in via Pyodide on the host). First call downloads
+// Pyodide from CDN (~10MB) and stalls for a few seconds — subsequent calls
+// are fast because the interpreter is cached.
+const PYTHON_EXAMPLES: string[] = [
+  // Simplest
+  'python3 -c "print(2 + 2)"',
+  // Version
+  'python3 --version',
+  // sys module
+  'python3 -c "import sys; print(sys.version_info)"',
+  // stdlib usage
+  'python3 -c "import math; print(math.pi, math.sqrt(2))"',
+  // JSON + list comprehension
+  'python3 -c "import json; print(json.dumps([x*x for x in range(6)]))"',
+  // Read TFS-seeded file via Pyodide's node:fs bridge — wait, no: Python
+  // sees Pyodide's own FS, not DuskJS TFS. Show the equivalent via -c:
+  'python3 -c "print(\'\\n\'.join(str(n) for n in range(5)))"',
+  // Multi-statement via inline exec
+  'python3 -c "d = {\'a\':1,\'b\':2}; print(sum(d.values()))"',
+  // Read a script FROM TFS: seed one with dsh, then run it
+  'echo "print(\'from tfs\')" > /tmp/hi.py && python3 /tmp/hi.py',
+  // Piped script
+  'echo "print(\'stdin script\')" | python3',
+  // python alias
+  'python -c "print(\'via python alias\')"',
 ];
 
 export const startPage = async (): Promise<void> => {
@@ -72,6 +121,8 @@ export const startPage = async (): Promise<void> => {
   const line = document.getElementById('line') as HTMLInputElement;
   const examples = document.getElementById('examples') as HTMLDivElement;
   const nodeExamples = document.getElementById('node-examples') as HTMLDivElement;
+  const sqliteExamples = document.getElementById('sqlite-examples') as HTMLDivElement;
+  const pythonExamples = document.getElementById('python-examples') as HTMLDivElement;
   const fsview = document.getElementById('fsview') as HTMLPreElement;
   const clearfs = document.getElementById('clearfs') as HTMLButtonElement;
 
@@ -92,8 +143,8 @@ export const startPage = async (): Promise<void> => {
     net: { loadLibcurl: loadRealLibcurl, proxyUrl: 'wss://gointospace.app/wisp/' },
     seed: TRANSCRIPT_SEED,
   });
-  write('spawning /bin/jsh (interactive)...\n');
-  const sh = await repl.processManager.spawn('/bin/jsh', [], {
+  write('spawning /bin/dsh (interactive)...\n');
+  const sh = await repl.processManager.spawn('/bin/dsh', [], {
     cwd: '/root',
     env: { HOME: '/root', PATH: '/usr/local/bin:/usr/bin:/bin', TERM: 'xterm-256color', USER: 'dusk' },
     pty: { cols: 80, rows: 24 },
@@ -157,5 +208,17 @@ export const startPage = async (): Promise<void> => {
     // and the label above the section explains the ordering.
     btn.addEventListener('click', () => { void submit(ex); });
     nodeExamples.appendChild(btn);
+  }
+  for (const ex of SQLITE_EXAMPLES) {
+    const btn = document.createElement('button');
+    btn.textContent = ex;
+    btn.addEventListener('click', () => { void submit(ex); });
+    sqliteExamples.appendChild(btn);
+  }
+  for (const ex of PYTHON_EXAMPLES) {
+    const btn = document.createElement('button');
+    btn.textContent = ex;
+    btn.addEventListener('click', () => { void submit(ex); });
+    pythonExamples.appendChild(btn);
   }
 };

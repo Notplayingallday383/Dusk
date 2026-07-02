@@ -1,6 +1,6 @@
 // TfsFs — adapter that implements just-bash's IFileSystem on top of DuskJS's
 // TFS (accessed via the __fs IPC bridge). Writes go straight to TFS, so
-// changes made inside jsh persist across process invocations and are visible
+// changes made inside dsh persist across process invocations and are visible
 // to other binaries that read TFS directly.
 //
 // Coverage
@@ -35,7 +35,7 @@ type FsGlobal = {
 
 const getFs = (): FsGlobal => {
   const fs = (globalThis as Record<string, unknown>)['__fs'] as FsGlobal | undefined;
-  if (!fs) throw new Error('__fs not available (jsh must run inside a DuskJS world)');
+  if (!fs) throw new Error('__fs not available (dsh must run inside a DuskJS world)');
   return fs;
 };
 
@@ -92,7 +92,32 @@ export class TfsFs {
 
   // --- writes -----------------------------------------------------------
   async writeFile(path: string, content: string | Uint8Array, _options?: unknown): Promise<void> {
+    this.ensureParent(path);
     this.fs().writeFile(path, normalizeContent(content));
+  }
+
+  // Synchronous variant — just-bash's Bash.registerCommand uses this to
+  // create /bin/<name> and /usr/bin/<name> stubs (see Bash.ts:524).
+  // Our TFS IPC is fire-and-forget from the engine's perspective, so a
+  // synchronous send that ignores the response is close enough for these
+  // idempotent-write stubs.
+  writeFileSync(path: string, content: string | Uint8Array): void {
+    try {
+      this.ensureParent(path);
+      this.fs().writeFile(path, normalizeContent(content));
+    } catch { /* ignore, best-effort */ }
+  }
+
+  // Auto-mkdir the parent of `path`. Idempotent (mkdir with recursive:true).
+  // Needed because register-time stubs land at /bin/<name> and /usr/bin/<name>
+  // when neither dir may exist yet.
+  private ensureParent(path: string): void {
+    const lastSlash = path.lastIndexOf('/');
+    if (lastSlash <= 0) return; // root or bare filename
+    const parent = path.slice(0, lastSlash);
+    try {
+      if (!this.fs().exists(parent)) this.fs().mkdir(parent, true);
+    } catch { /* best-effort */ }
   }
 
   async appendFile(path: string, content: string | Uint8Array, _options?: unknown): Promise<void> {
@@ -123,6 +148,9 @@ export class TfsFs {
 
   // --- directory ops ---------------------------------------------------
   async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
+    // Always pass recursive=true if requested; the underlying IPC honors it.
+    // If recursive is false but the parent is missing, let TFS surface the
+    // error (matches POSIX mkdir behavior).
     this.fs().mkdir(path, !!options?.recursive);
   }
 

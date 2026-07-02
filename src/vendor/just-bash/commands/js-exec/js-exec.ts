@@ -2,7 +2,7 @@
 // DuskJS replacement for just-bash's js-exec.
 //
 // The original js-exec ran JS in a QuickJS WASM worker for sandboxing. In
-// DuskJS the whole jsh binary already runs inside the SpiderMonkey engine
+// DuskJS the whole dsh binary already runs inside the SpiderMonkey engine
 // worker (which IS the sandbox — WASI-isolated from the host page). So we
 // can eval user JS directly in this engine's globalThis. Captures console
 // output and returns it as the command's stdout/stderr.
@@ -159,14 +159,14 @@ export const jsExecCommand: Command = {
 
     if (parsed.fromStdin) {
       // No -c, no file, no piped input — the user typed `node` or `js-exec`
-      // expecting an interactive REPL. We don't have one inside jsh (jsh is
+      // expecting an interactive REPL. We don't have one inside dsh (dsh is
       // line-based, not stream-based). Print a hint instead of silently
       // consuming empty stdin.
       if (!stdinText) {
         const name = argv[0] === "node" ? "node" : "js-exec";
         return {
           stdout: "",
-          stderr: name + ": interactive REPL not available inside jsh.\n" +
+          stderr: name + ": interactive REPL not available inside dsh.\n" +
                   "  Use: " + name + " -c \"<code>\"   or   echo '<code>' | " + name + "\n" +
                   "  For a real REPL, spawn /bin/node directly from the host.\n",
           exitCode: 1,

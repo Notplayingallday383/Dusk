@@ -1,21 +1,24 @@
-// /bin/jsh — DuskJS binary wrapping just-bash's Bash class.
+// /bin/dsh — Dusk SHell. DuskJS binary wrapping just-bash's Bash class.
 //
+// Also aliased as /bin/sh and /bin/jsh (see host/process-manager.ts:319+).
 // Provides ~90 commands (grep, sed, awk, find, sort, uniq, cut, cp, mv, tar,
-// jq, printf, tee, base64, xargs, and more) via the just-bash npm package
+// jq, printf, tee, base64, xargs, and more) via the vendored just-bash source
 // (Apache-2.0, Vercel Labs — see /NOTICE).
 //
 // Usage:
-//   jsh -c "grep -r TODO /src"     # inline script
-//   jsh                            # interactive REPL
-//   jsh script.sh                  # run script file
+//   dsh -c "grep -r TODO /src"     # inline script
+//   dsh                            # interactive REPL
+//   dsh script.sh                  # run script file
 //
-// Filesystem: jsh runs against DuskJS's TFS directly via the TfsFs adapter.
-// Writes are immediately visible to other binaries and persist across jsh
+// Filesystem: dsh runs against DuskJS's TFS directly via the TfsFs adapter.
+// Writes are immediately visible to other binaries and persist across dsh
 // invocations. Symlinks/hardlinks/chmod/utimes are degraded (TFS lacks them);
 // see tfs-fs.ts for the coverage matrix.
 
 import { Bash } from '../../vendor/just-bash/Bash';
 import { TfsFs } from './tfs-fs';
+import { sqlite3Command } from './commands/sqlite3-command';
+import { python3Command, pythonCommand } from './commands/python3-command';
 
 type ProcessGlobal = {
   argv: string[];
@@ -78,10 +81,46 @@ const collectStdinAll = (): string => {
   return s;
 };
 
-const runOnce = async (bash: Bash, script: string, stdin: string): Promise<number> => {
+// Wire positional args into the shell's $0, $1, $#, $@, $* — matching
+// bash -c script args... behavior. just-bash surfaces these through the
+// exec env under keys "0", "1", "#", etc. (see vendor/…/commands/bash/bash.ts).
+const buildPositionalEnv = (scriptName: string, args: string[]): Record<string, string> => {
+  const env: Record<string, string> = {
+    '0': scriptName,
+    '#': String(args.length),
+    '@': args.join(' '),
+    '*': args.join(' '),
+  };
+  args.forEach((a, i) => { env[String(i + 1)] = a; });
+  return env;
+};
+
+// dsh tracks its own cwd across interactive lines so `cd` persists. First
+// call gets the process's cwd; subsequent calls reuse whatever the last
+// exec left in state (which just-bash updates in state.cwd on cd).
+let dshCwdState: string | null = null;
+
+const runOnce = async (
+  bash: Bash,
+  script: string,
+  stdin: string,
+  positionalArgs: string[] = [],
+  scriptName = 'dsh',
+): Promise<number> => {
   const proc = getProc();
-  const cwd = proc?.cwd ? proc.cwd() : '/';
-  const result = await bash.exec(script, { cwd, stdin });
+  if (dshCwdState === null) dshCwdState = proc?.cwd ? proc.cwd() : '/';
+  const env = positionalArgs.length > 0 || scriptName !== 'dsh'
+    ? buildPositionalEnv(scriptName, positionalArgs)
+    : undefined;
+  const opts: Parameters<Bash['exec']>[1] = { cwd: dshCwdState, stdin };
+  if (env) opts.env = env;
+  const result = await bash.exec(script, opts);
+  // Persist any cd from this invocation. just-bash's exec restores state.cwd
+  // after the call, but exposes the final PWD via result.env. Pull that
+  // out and use it as our next cwd — this is how the interactive prompt
+  // gets `cd /tmp` to persist between lines.
+  const nextPwd = result.env?.['PWD'];
+  if (typeof nextPwd === 'string' && nextPwd.length > 0) dshCwdState = nextPwd;
   if (result.stdout) proc?.stdout.write(result.stdout);
   if (result.stderr) proc?.stderr.write(result.stderr);
   return result.exitCode;
@@ -165,7 +204,7 @@ const runNodeRepl = async (
       const cmd = raw.trim();
       if (cmd === '.exit' || cmd === '.quit') return;
       if (cmd === '.help') {
-        stdout.write('.help    show this help\n.exit    return to jsh\n.clear   reset REPL context\n(end a line with \\ to continue on the next line)\n');
+        stdout.write('.help    show this help\n.exit    return to dsh\n.clear   reset REPL context\n(end a line with \\ to continue on the next line)\n');
         continue;
       }
       if (cmd === '.clear') {
@@ -212,7 +251,7 @@ const runInteractive = async (bash: Bash): Promise<number> => {
   const stdout = proc.stdout;
   const stderr = proc.stderr;
   const ipc = (globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string } } }).ipc;
-  if (!ipc) { stderr.write('jsh: no stdin available\n'); return 1; }
+  if (!ipc) { stderr.write('dsh: no stdin available\n'); return 1; }
 
   const readStdin = (): Uint8Array | null => {
     try {
@@ -230,7 +269,7 @@ const runInteractive = async (bash: Bash): Promise<number> => {
     return s;
   };
 
-  // A shared line-buffered reader so both jsh mode and node REPL mode can
+  // A shared line-buffered reader so both dsh mode and node REPL mode can
   // pull one line at a time from the same stdin stream.
   let lineBuf = '';
   const readLine = async (): Promise<string | null> => {
@@ -256,7 +295,7 @@ const runInteractive = async (bash: Bash): Promise<number> => {
 
   let exitCode = 0;
   while (true) {
-    stdout.write('jsh$ ');
+    stdout.write('dsh$ ');
     const line = await readLine();
     if (line === null) break;
     const script = line.trim();
@@ -266,7 +305,7 @@ const runInteractive = async (bash: Bash): Promise<number> => {
       return exitCode;
     }
     // `node` (with no args) enters the interactive REPL mode. This is a
-    // jsh-side hijack — the js-exec/node command in the registry only handles
+    // dsh-side hijack — the js-exec/node command in the registry only handles
     // -c/-e/file mode; interactive belongs at the shell level.
     if (script === 'node') {
       try {
@@ -279,7 +318,7 @@ const runInteractive = async (bash: Bash): Promise<number> => {
     try {
       exitCode = await runOnce(bash, script, '');
     } catch (e) {
-      stderr.write('jsh: ' + String(e) + '\n');
+      stderr.write('dsh: ' + String(e) + '\n');
       exitCode = 2;
     }
   }
@@ -324,8 +363,8 @@ export const main = async (): Promise<number> => {
   }
 
   if (showHelp) {
-    proc.stdout.write('jsh — DuskJS shell (powered by just-bash)\n');
-    proc.stdout.write('Usage: jsh [-c script] [script-file] [args...]\n');
+    proc.stdout.write('dsh — Dusk SHell (powered by just-bash)\n');
+    proc.stdout.write('Usage: dsh [-c script] [script-file] [args...]\n');
     proc.stdout.write('Options:\n');
     proc.stdout.write('  -c script     Run inline script and exit\n');
     proc.stdout.write('  -             Read script from stdin\n');
@@ -336,7 +375,7 @@ export const main = async (): Promise<number> => {
   }
 
   if (showVersion) {
-    proc.stdout.write('jsh (DuskJS shell / just-bash) 3.0.2\n');
+    proc.stdout.write('dsh (Dusk SHell / just-bash 3.0.2)\n');
     if (proc.exit) proc.exit(0);
     return 0;
   }
@@ -344,7 +383,7 @@ export const main = async (): Promise<number> => {
   // Build a just-bash environment backed by DuskJS's TFS. Writes hit TFS
   // immediately and are visible to other binaries (no snapshotting).
   if (!fs) {
-    proc.stderr.write('jsh: __fs global missing; TFS bridge unavailable\n');
+    proc.stderr.write('dsh: __fs global missing; TFS bridge unavailable\n');
     if (proc.exit) proc.exit(1);
     return 1;
   }
@@ -355,26 +394,36 @@ export const main = async (): Promise<number> => {
     // Enable JS: registers `js-exec` and `node` commands that route to a
     // DuskJS-native in-engine eval (see vendor/just-bash/commands/js-exec/).
     javascript: true,
-    // No network for now (libcurl bridge is DuskJS-side, not exposed to jsh yet).
-    // No python — WASM CPython not integrated.
+    // No network for now (libcurl bridge is DuskJS-side, not exposed to dsh yet).
+    // Custom DuskJS commands: sqlite3 (via host sql.js bridge), python3 (via
+    // host Pyodide bridge). See ./commands/. Each of these routes IPC through
+    // the same channel other host funcs use (fs.*, net.*).
+    customCommands: [sqlite3Command, python3Command, pythonCommand],
   });
 
   let code: number;
   if (scriptInline !== null) {
     const stdin = readStdinInline();
-    code = await runOnce(bash, scriptInline, stdin);
+    // For `dsh -c "script" arg0 arg1 arg2`: matches bash's -c behavior —
+    // arg0 becomes $0, arg1 becomes $1, arg2 becomes $2. If no args, $0
+    // defaults to 'dsh'. This is deliberately DIFFERENT from `dsh script`
+    // (where $0 = script path). See POSIX sh -c behavior.
+    const inlineScriptName = scriptArgs.length > 0 ? scriptArgs[0]! : 'dsh';
+    const inlinePositional = scriptArgs.length > 0 ? scriptArgs.slice(1) : [];
+    code = await runOnce(bash, scriptInline, stdin, inlinePositional, inlineScriptName);
   } else if (scriptFile !== null) {
     let content: string;
     try {
       if (!fs) throw new Error('__fs not available');
       content = fs.readFile(scriptFile);
     } catch (e) {
-      proc.stderr.write('jsh: ' + scriptFile + ': ' + String(e) + '\n');
+      proc.stderr.write('dsh: ' + scriptFile + ': ' + String(e) + '\n');
       if (proc.exit) proc.exit(1);
       return 1;
     }
     const stdin = readStdinInline();
-    code = await runOnce(bash, content, stdin);
+    // For `dsh script.sh a b c`: $0 = script.sh, $1... = a b c.
+    code = await runOnce(bash, content, stdin, scriptArgs, scriptFile);
   } else {
     code = await runInteractive(bash);
   }
@@ -384,7 +433,7 @@ export const main = async (): Promise<number> => {
 };
 
 // Only collect stdin bytes if there are any immediately-available chunks;
-// don't block. Used for `jsh -c ...` where the caller may pipe input or not.
+// don't block. Used for `dsh -c ...` where the caller may pipe input or not.
 const readStdinInline = (): string => {
   const first = readStdinSync();
   if (first === null || first.length === 0) return '';

@@ -6,7 +6,9 @@ import { norm, dirname } from './vfs';
 import { SERIAL_RES_SIZE } from '../protocol/messages';
 import shellBinarySource from '../shell/binary-entry.ts?worldsrc';
 import nodeBinarySource from '../binaries/node/binary-entry.ts?worldsrc';
-import jshBinarySource from '../binaries/jsh/binary-entry.ts?worldsrc';
+import dshBinarySource from '../binaries/dsh/binary-entry.ts?worldsrc';
+import sqlite3BinarySource from '../binaries/sqlite3/binary-entry.ts?worldsrc';
+import python3BinarySource from '../binaries/python3/binary-entry.ts?worldsrc';
 import { BUILTIN_BINARIES } from './builtin-binaries';
 import { DPM_BUNDLES } from './dpm-binaries';
 import { createSocketRegistry, type SocketRegistry, type SocketPair } from './socket-registry';
@@ -313,12 +315,22 @@ export class ProcessManager {
     return t;
   }
 
-  constructor(fs: FSBackend, netFuncs: FuncTable = {}) {
+  constructor(fs: FSBackend, netFuncs: FuncTable = {}, extraFuncs: FuncTable = {}) {
     this.fs = fs;
-    this.netFuncs = netFuncs;
-    this.registerBinary('/bin/sh', shellBinarySource);
+    this.netFuncs = { ...netFuncs, ...extraFuncs };
+    // /bin/dsh (Dusk SHell) is the canonical shell. /bin/sh and /bin/jsh
+    // are aliases so scripts using shebang `#!/bin/sh` and existing
+    // demos/tests that reference /bin/jsh keep working. shellBinarySource
+    // (the legacy shell v2) is retained under /bin/sh.legacy for now in
+    // case anything explicitly needs it — remove once dsh proves stable.
+    this.registerBinary('/bin/dsh', dshBinarySource);
+    this.registerBinary('/bin/sh', dshBinarySource);
+    this.registerBinary('/bin/jsh', dshBinarySource);
+    this.registerBinary('/bin/sh.legacy', shellBinarySource);
     this.registerBinary('/bin/node', nodeBinarySource);
-    this.registerBinary('/bin/jsh', jshBinarySource);
+    this.registerBinary('/bin/sqlite3', sqlite3BinarySource);
+    this.registerBinary('/bin/python3', python3BinarySource);
+    this.registerBinary('/bin/python', python3BinarySource);
     for (const [name, source] of Object.entries(DPM_BUNDLES)) {
       this.registerBinary(name, source);
     }
