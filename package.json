@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite dev",
     "build": "tsc && vite build",
+    "preview": "vite preview",
+    "serve": "npm run build && npm run preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -19,6 +21,7 @@
     "ini": "^7.0.0",
     "libcurl.js": "0.7.4",
     "minimatch": "^10.2.5",
+    "nova-wasm": "file:./vendor/nova-wasm",
     "papaparse": "^5.5.4",
     "pyodide": "^314.0.2",
     "re2js": "^2.8.5",

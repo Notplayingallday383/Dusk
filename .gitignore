@@ -5,3 +5,4 @@ dist/
 .vitest-attachments/
 package-lock.json
 test/__screenshots__/
+vendor/
