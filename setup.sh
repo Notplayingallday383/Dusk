@@ -15,7 +15,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 VENDOR="$REPO_ROOT/vendor"
-NOVA_REPO_URL="${NOVA_REPO_URL:-https://github.com/nightnetwork/nova.git}"
+NOVA_REPO_URL="${NOVA_REPO_URL:-https://github.com/Night-N3twork/Nova.git}"
 NOVA_REF="${NOVA_REF:-main}"
 
 mkdir -p "$VENDOR"
