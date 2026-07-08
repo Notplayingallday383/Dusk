@@ -1,0 +1,1 @@
+{"version":3,"file":"spidermonkey.d.ts","sourceRoot":"","sources":["../../../src/engine/spidermonkey.ts"],"names":[],"mappings":"AAEA,MAAM,WAAW,YAAY;IAC3B,OAAO,EAAE,MAAM,CAAC;IAChB,IAAI,EAAE,MAAM,EAAE,CAAC;IACf;;;;OAIG;IACH,UAAU,CAAC,EAAE,WAAW,CAAC,MAAM,CAAC;CACjC;AAKD,eAAO,MAAM,mBAAmB,QAAa,OAAO,CAAC,YAAY,CAiBhE,CAAC;AAEF;;;;GAIG;AACH,eAAO,MAAM,aAAa,QAAO,IAGhC,CAAC"}

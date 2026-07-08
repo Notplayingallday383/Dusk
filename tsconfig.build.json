@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "./lib/types",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": [
+    "src/vendor",
+    "src/vendor/**",
+    "src/world",
+    "src/world/**",
+    "src/binaries",
+    "src/binaries/**",
+    "src/shell",
+    "src/shell/**",
+    "src/worker",
+    "src/worker/**",
+    "src/**/*.test.ts",
+    "**/*.test.ts",
+    "test",
+    "test/**"
+  ]
+}
