@@ -11,7 +11,7 @@ export interface SocketPair {
     errorClient: (msg: string) => void;
 }
 export interface SocketRegistry {
-    registerServer(host: string, port: number, enginePid: number, onConn: (clientSocketId: number) => void): number;
+    registerServer(host: string, port: number, enginePid: number, onConn: (clientSocketId: number) => void): RegisteredServer;
     unregisterServer(id: number): void;
     findServer(host: string, port: number): RegisteredServer | undefined;
     allocateSocketId(): number;

@@ -15,6 +15,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // app-mode build (`npm run build`) which serves the src/demo/ REPL page
 // from `dist/`.
 export default defineConfig({
+  base: './',
   plugins: [worldSource()],
   worker: { format: 'es' },
   define: {

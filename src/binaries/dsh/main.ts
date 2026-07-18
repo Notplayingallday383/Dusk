@@ -177,7 +177,22 @@ const runNodeRepl = async (
   // resolve). The set-trap stores exclusively on ctx.
   const state: Record<string, unknown> = Object.create(null);
   const ctxProxy = new Proxy(state, {
-    has(_target, _key): boolean { return true; },
+    has(_target, key): boolean {
+      // CRITICAL: `eval` must NOT resolve through the with-scope. If the
+      // has-trap returns true for 'eval', then `eval(code)` inside `with`
+      // becomes an aliased/indirect eval per ECMA-262 §19.2.1 — indirect
+      // eval runs in global scope and does NOT inherit the enclosing
+      // async function's status, which makes top-level `await` in `code`
+      // throw "await is only valid in async functions". Returning false
+      // here lets `eval` resolve as a normal free binding (the direct
+      // builtin), which preserves direct-eval semantics: same lexical
+      // scope, same async status, same strictness.
+      //
+      // We also exclude 'arguments' for the same class of reason (avoid
+      // shadowing the async function's synthetic arguments object).
+      if (typeof key === 'string' && (key === 'eval' || key === 'arguments')) return false;
+      return true;
+    },
     get(target, key: PropertyKey): unknown {
       if (key === Symbol.unscopables) return undefined;
       if (key in target) return (target as Record<PropertyKey, unknown>)[key];
@@ -232,12 +247,35 @@ const runNodeRepl = async (
     let result: unknown;
     let threw = false;
     try {
+      // Wrap in `new Function(...)` (non-strict) so `with (__ctx)` is legal
+      // — AsyncFunction bodies are always strict and would reject `with`.
+      // Inside, an async IIFE hosts `eval(code)`. The critical bit: our
+      // Proxy's has-trap now returns false for 'eval' (see ctxProxy above),
+      // so `eval` resolves as the direct free binding — this is DIRECT eval,
+      // which inherits the enclosing arrow's async status. That's what makes
+      // top-level `await` legal in `code`. Making eval resolve through
+      // `with` (indirect eval) would silently break async — SpiderMonkey
+      // reports "await is only valid in async functions" in that path.
       // eslint-disable-next-line no-new-func
-      const fn = new Function('__ctx', 'with (__ctx) { return (async () => { return eval(' + JSON.stringify(code) + '); })(); }');
+      const fn = new Function('__ctx',
+        'with (__ctx) { return (async () => { return eval(' + JSON.stringify(code) + '); })(); }');
       result = await (fn as (c: Record<string, unknown>) => Promise<unknown>)(ctx);
     } catch (e) {
       threw = true;
-      stderr.write('Uncaught ' + (e instanceof Error ? (e.stack || (e.name + ': ' + e.message)) : String(e)) + '\n');
+      // SpiderMonkey's Error.stack does NOT include the `name: message`
+      // header line (unlike V8), so relying on stack alone hides the actual
+      // error text. Always print the header line first, then the stack for
+      // context. This is what makes REPL errors debuggable.
+      if (e instanceof Error) {
+        const header = (e.name || 'Error') + ': ' + (e.message || String(e));
+        const stack = e.stack ? String(e.stack) : '';
+        // If the stack already begins with the header (some engines do this),
+        // don't duplicate it.
+        const body = stack && !stack.startsWith(header) ? header + '\n' + stack : (stack || header);
+        stderr.write('Uncaught ' + body + '\n');
+      } else {
+        stderr.write('Uncaught ' + String(e) + '\n');
+      }
     }
     if (!threw && result !== undefined) {
       stdout.write(inspect(result) + '\n');

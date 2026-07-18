@@ -1,7 +1,21 @@
 {
-  "name": "duskjs",
-  "version": "0.1.0",
+  "name": "@nightnetwork/dusk",
+  "version": "0.5.0",
+  "description": "Node.js in a browser tab. A complete JavaScript runtime powered by SpiderMonkey WASI.",
   "type": "module",
+  "license": "Apache-2.0",
+  "author": "NightNetwork",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicholasgasior/nightnetwork-dusk"
+  },
+  "homepage": "https://github.com/nicholasgasior/nightnetwork-dusk#readme",
+  "bugs": {
+    "url": "https://github.com/nicholasgasior/nightnetwork-dusk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",

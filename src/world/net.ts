@@ -1,3 +1,5 @@
+import { registerFetchDispatch } from './net-router';
+
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 
 const call = (f: string, extra: Record<string, unknown>): unknown => {
@@ -10,18 +12,16 @@ export const installNet = (): void => {
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   const wsHandlers = new Map<number, Record<string, ((d: unknown) => void)[]>>();
 
-  (globalThis as Record<string, unknown>)['__net'] = {
-    dispatch: (id: number, kind: string, payload: unknown): void => {
-      const p = pending.get(id);
-      if (p) {
-        if (kind === 'response') { p.resolve(payload); pending.delete(id); }
-        else if (kind === 'error') { p.reject(new Error(String(payload))); pending.delete(id); }
-        return;
-      }
-      const handlers = wsHandlers.get(id);
-      if (handlers) for (const cb of handlers[kind] ?? []) cb(payload);
-    },
-  };
+  registerFetchDispatch((id: number, kind: string, payload: unknown): void => {
+    const p = pending.get(id);
+    if (p) {
+      if (kind === 'response') { p.resolve(payload); pending.delete(id); }
+      else if (kind === 'error') { p.reject(new Error(String(payload))); pending.delete(id); }
+      return;
+    }
+    const handlers = wsHandlers.get(id);
+    if (handlers) for (const cb of handlers[kind] ?? []) cb(payload);
+  });
 
   (globalThis as Record<string, unknown>)['fetch'] = (url: string, opts?: unknown): Promise<unknown> => {
     const id = call('net.fetch', { url, opts }) as number;

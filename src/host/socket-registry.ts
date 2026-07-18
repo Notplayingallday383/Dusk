@@ -28,7 +28,7 @@ export interface SocketPair {
 }
 
 export interface SocketRegistry {
-  registerServer(host: string, port: number, enginePid: number, onConn: (clientSocketId: number) => void): number;
+  registerServer(host: string, port: number, enginePid: number, onConn: (clientSocketId: number) => void): RegisteredServer;
   unregisterServer(id: number): void;
   findServer(host: string, port: number): RegisteredServer | undefined;
   allocateSocketId(): number;
@@ -39,8 +39,11 @@ export interface SocketRegistry {
 }
 
 export const createSocketRegistry = (): SocketRegistry => {
+  const ephemeralStart = 49_152;
+  const ephemeralEnd = 65_535;
   let nextServerId = 1;
   let nextSocketId = 1;
+  let nextEphemeralPort = ephemeralStart;
   const servers = new Map<string, RegisteredServer>();
   const pairs = new Map<number, SocketPair>();
 
@@ -48,9 +51,31 @@ export const createSocketRegistry = (): SocketRegistry => {
 
   return {
     registerServer(host, port, enginePid, onConn) {
+      if (port === 0) {
+        const candidateCount = ephemeralEnd - ephemeralStart + 1;
+        for (let i = 0; i < candidateCount; i++) {
+          const candidate = nextEphemeralPort;
+          nextEphemeralPort = candidate === ephemeralEnd ? ephemeralStart : candidate + 1;
+          if (!servers.has(keyOf(host, candidate))) {
+            port = candidate;
+            break;
+          }
+        }
+        if (port === 0) {
+          const error = new Error(`EADDRINUSE: no ephemeral ports available for ${host}`);
+          (error as Error & { code?: string }).code = 'EADDRINUSE';
+          throw error;
+        }
+      }
+      if (servers.has(keyOf(host, port))) {
+        const error = new Error(`EADDRINUSE: address already in use ${host}:${port}`);
+        (error as Error & { code?: string }).code = 'EADDRINUSE';
+        throw error;
+      }
       const id = nextServerId++;
-      servers.set(keyOf(host, port), { id, host, port, enginePid, onConnection: onConn });
-      return id;
+      const server = { id, host, port, enginePid, onConnection: onConn };
+      servers.set(keyOf(host, port), server);
+      return server;
     },
     unregisterServer(id) {
       for (const [k, v] of servers) if (v.id === id) servers.delete(k);

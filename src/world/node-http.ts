@@ -3,6 +3,7 @@ import { Writable, Readable } from './node-stream';
 import { Socket, createConnection, Server as NetServer } from './node-net';
 import { HttpParser, type HttpHeadersInfo } from './http-parser';
 import { errnoError } from './node-errors';
+import { Buffer } from './node-buffer';
 
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
@@ -298,7 +299,7 @@ export class ClientRequest extends OutgoingMessage {
       }
       this.emit('response', res);
     };
-    parser.onBody = (chunk) => { if (res) res.push(chunk); };
+    parser.onBody = (chunk) => { if (res) res.push(Buffer.from(chunk)); };
     parser.onMessageComplete = () => { if (res) { res.complete = true; res.push(null); } };
     parser.onError = (err) => { this.emit('error', err); };
 
@@ -421,6 +422,16 @@ export class Server extends EventEmitter {
     return this._net.address();
   }
 
+  ref(): this {
+    this._net.ref();
+    return this;
+  }
+
+  unref(): this {
+    this._net.unref();
+    return this;
+  }
+
   private _onConnection(socket: Socket): void {
     const parser = new HttpParser('REQUEST');
     let req: IncomingMessage | null = null;
@@ -440,7 +451,7 @@ export class Server extends EventEmitter {
       res = new ServerResponse(socket);
       this.emit('request', req, res);
     };
-    parser.onBody = (chunk) => { if (req) req.push(chunk); };
+    parser.onBody = (chunk) => { if (req) req.push(Buffer.from(chunk)); };
     parser.onMessageComplete = () => { if (req) { req.complete = true; req.push(null); } };
     parser.onError = (err) => { this.emit('clientError', err, socket); };
 

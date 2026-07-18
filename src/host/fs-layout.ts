@@ -69,9 +69,11 @@ const stripPrefix = (path: string, prefix: string): string => {
 };
 
 const buildSyntheticBin = (pm: ProcessManager): FSBackend => {
-  const fileFor = (name: string): string | undefined => {
+  const fileFor = async (name: string): Promise<string | undefined> => {
     const src = pm.getBinarySource(name);
     if (src !== undefined) return src;
+    const loaded = await pm.loadBinarySource(name);
+    if (loaded !== undefined) return loaded;
     if (pm.hasBinary(name)) return `#!/bin/sh\n# builtin: ${name}\n`;
     return undefined;
   };
@@ -80,7 +82,7 @@ const buildSyntheticBin = (pm: ProcessManager): FSBackend => {
       const n = norm(path);
       if (n === '/' || n === '') throw enotDir(path);
       const name = '/bin' + n;
-      const src = fileFor(name);
+      const src = await fileFor(name);
       if (src === undefined) throw enotEnt(path);
       return src;
     },

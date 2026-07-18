@@ -1,20 +1,27 @@
-import { ProcessManager, type DuskProcessHandle } from './host/process-manager';
+import { ProcessManager, type DuskProcessHandle, type RelayListener } from './host/process-manager';
 import { type LibCurl } from './host/net';
 import { type DuskRepl } from './repl/repl';
 import type { EngineInstance } from './host/engine-instance';
 export { createRunner } from './host/runner';
 export { createEngine } from './host/engine-instance';
 export { ProcessManager } from './host/process-manager';
+export type { RelayListener, RelaySocket } from './host/process-manager';
 export { startRepl } from './repl/repl';
 export { createMemoryBackend, createTfsBackend } from './host/fs-backend';
 export { createLayoutBackend } from './host/fs-layout';
 export { initEnginePool, isPoolWarm } from './host/engine-pool';
 export { prewarmEngine } from './engine/spidermonkey';
+export type BootReplNetOptions = {
+    loadLibcurl: () => Promise<LibCurl>;
+    proxyUrl: string;
+    relay?: RelayListener;
+} | {
+    relay: RelayListener;
+    loadLibcurl?: never;
+    proxyUrl?: never;
+};
 export interface BootReplOptions {
-    net?: {
-        loadLibcurl: () => Promise<LibCurl>;
-        proxyUrl: string;
-    };
+    net?: BootReplNetOptions;
     seed?: Record<string, string>;
     fs?: 'tfs' | 'memory';
     user?: string;

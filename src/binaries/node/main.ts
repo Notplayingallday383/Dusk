@@ -1,6 +1,6 @@
 // /bin/node main entry — runs on engine startup.
 
-const main = async (): Promise<void> => {
+export const main = async (): Promise<number> => {
   const proc = (globalThis as Record<string, unknown>)['process'] as {
     argv: string[];
     env: Record<string, string>;
@@ -19,7 +19,7 @@ const main = async (): Promise<void> => {
 
   if (args.length === 0) {
     await startRepl();
-    return;
+    return 0;
   }
 
   let i = 0;
@@ -33,7 +33,7 @@ const main = async (): Promise<void> => {
     if (a === '--version' || a === '-v') {
       proc?.stdout.write((proc?.version ?? 'v20.0.0') + '\n');
       proc?.exit?.(0);
-      return;
+      return 0;
     }
     if (a === '-e' || a === '--eval') {
       evalExpr = args[++i];
@@ -72,10 +72,38 @@ const main = async (): Promise<void> => {
     } else if (scriptPath !== undefined) {
       await runScript(scriptPath);
     }
+    await waitForActiveHandles();
     proc?.exit?.(0);
+    return 0;
   } catch (e) {
-    proc?.stderr.write(((e as Error).stack ?? String(e)) + '\n');
+    // SpiderMonkey's Error.stack omits the `name: message` header line,
+    // so relying on stack alone loses the actual error text and makes
+    // scripts look silently failed. Always print the header first.
+    if (e instanceof Error) {
+      const header = (e.name || 'Error') + ': ' + (e.message || String(e));
+      const stack = e.stack ? String(e.stack) : '';
+      const body = stack && !stack.startsWith(header) ? header + '\n' + stack : (stack || header);
+      proc?.stderr.write(body + '\n');
+    } else {
+      proc?.stderr.write(String(e) + '\n');
+    }
     proc?.exit?.(1);
+    return 1;
+  }
+};
+
+const waitForActiveHandles = async (): Promise<void> => {
+  while (true) {
+    // Let script-scheduled microtasks establish handles before deciding the
+    // process is idle. Repeat after each release for close callbacks that
+    // replace one active handle with another.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const state = (globalThis as Record<string, unknown>)['__nodeActiveHandles'] as {
+      count: number;
+      waiters: Set<() => void>;
+    } | undefined;
+    if (!state || state.count === 0) return;
+    await new Promise<void>((resolve) => state.waiters.add(resolve));
   }
 };
 
@@ -90,7 +118,15 @@ const runScript = async (path: string): Promise<unknown> => {
     return await imp(path);
   }
   // CJS
-  const source = fs.readFile(path);
+  let source = fs.readFile(path);
+  // Strip shebang. `#!` is only legal at the very start of a script/module,
+  // not inside the (function(exports, require, module, ...){ ... }) wrapper
+  // we emit below — leaving it in produces a syntax error. Node itself does
+  // the same strip (see Module.prototype._compile in Node core).
+  if (source.startsWith('#!')) {
+    const nl = source.indexOf('\n');
+    source = nl === -1 ? '' : source.slice(nl + 1);
+  }
   const dir = path.split('/').slice(0, -1).join('/') || '/';
   const req = (globalThis as Record<string, unknown>)['require'] as ((m: string) => unknown) | undefined;
   if (!req) throw new Error('require unavailable');
@@ -124,16 +160,36 @@ const detectEsm = (path: string): boolean => {
 };
 
 const runCjsInline = (expr: string, returnResult = false): unknown => {
-  const fn = (0, eval)('(function(){return (' + expr + ');})') as () => unknown;
-  try {
-    const r = fn();
-    return returnResult ? r : undefined;
-  } catch (e) {
-    // Fallback: eval as statements
-    if (returnResult) throw e;
-    (0, eval)(expr);
-    return undefined;
+  // Use `new Function` for statement/expression handling. It's more robust
+  // than an eval-based expression-wrap-then-fallback dance because:
+  //   - `new Function(body)` builds a function body that accepts any
+  //     statements (including `throw`, `if`, `for`, ...).
+  //   - The function runs cleanly; runtime throws propagate as errors,
+  //     not as SyntaxErrors from a failed expression wrap.
+  // For `-p` (returnResult=true) we still need to capture the last value,
+  // so we try the expression wrap first and fall back to a plain body.
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+  const F = Function as unknown as new (...args: string[]) => (...a: unknown[]) => unknown;
+  if (returnResult) {
+    try {
+      const fn = new F('return (' + expr + ')');
+      return fn();
+    } catch (e) {
+      // If the expression wrap threw at parse time (statement input) try
+      // a plain body — the last completion won't be captured but the code
+      // will at least run.
+      if (e instanceof SyntaxError) {
+        const fn = new F(expr);
+        return fn();
+      }
+      throw e;
+    }
   }
+  // No result needed — run as a plain function body. Runtime throws
+  // propagate to main()'s catch which prints the name:message header.
+  const fn = new F(expr);
+  fn();
+  return undefined;
 };
 
 const runEsmInline = async (expr: string, returnResult = false): Promise<unknown> => {
@@ -215,5 +271,3 @@ const startRepl = async (): Promise<void> => {
     await new Promise<void>(() => undefined);
   }
 };
-
-void main();

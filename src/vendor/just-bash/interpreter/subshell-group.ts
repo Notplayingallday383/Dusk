@@ -337,10 +337,63 @@ export async function executeUserScript(
     return failure(`bash: ${scriptPath}: No such file or directory\n`, 127);
   }
 
-  // Check for shebang and skip it if present (we'll execute as bash script)
-  // Note: we don't actually support different interpreters, just bash
+  // Shebang handling. Vanilla just-bash strips the shebang and parses the
+  // rest as bash. DuskJS ships JS bundles (dpm, npm, dpx, npx, pnpm) that
+  // start with `#!/usr/bin/env node` — parsing those as bash silently
+  // produces nothing. Intercept shebangs that point at a non-bash
+  // interpreter and delegate to it via the host process.spawnSync bridge.
   if (content.startsWith("#!")) {
     const firstNewline = content.indexOf("\n");
+    const shebangLine = firstNewline === -1 ? content.slice(2) : content.slice(2, firstNewline);
+    const trimmed = shebangLine.trim();
+    // Normalise `/usr/bin/env <name>` -> `/bin/<name>` (DuskJS binaries live in /bin only).
+    let interpreter: string | null = null;
+    const envMatch = /^(?:\/usr)?\/bin\/env\s+(\S+)/.exec(trimmed);
+    if (envMatch) {
+      const name = envMatch[1]!;
+      interpreter = name.startsWith("/") ? name : `/bin/${name}`;
+    } else {
+      const bareMatch = /^(\S+)/.exec(trimmed);
+      if (bareMatch) interpreter = bareMatch[1]!;
+    }
+    const isBashInterp = interpreter === "/bin/sh" || interpreter === "/bin/bash"
+      || interpreter === "/bin/dsh" || interpreter === "/bin/jsh";
+    if (interpreter && !isBashInterp) {
+      // Delegate to the host via process.spawnSync. We can't call it from
+      // vendored just-bash directly; use the engine's ipc bridge exposed on
+      // globalThis. If ipc isn't available (non-DuskJS host), fall back to
+      // stripping the shebang and parsing as bash — same as before.
+      const g = globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string } } };
+      if (g.ipc) {
+        // Encode stdin (a string in just-bash) as a byte array for the host.
+        const stdinBytes: number[] = [];
+        for (let i = 0; i < stdin.length; i++) stdinBytes.push(stdin.charCodeAt(i) & 0xff);
+        const spawnArgs = [scriptPath, ...args];
+        const spawnOpts: Record<string, unknown> = { cwd: ctx.state.cwd };
+        if (stdinBytes.length > 0) spawnOpts.stdin = stdinBytes;
+        // Materialise env into a plain object snapshot so the host sees the
+        // current shell env (PATH, HOME, etc.).
+        const envObj: Record<string, string> = {};
+        for (const [k, v] of ctx.state.env.entries()) envObj[k] = String(v);
+        spawnOpts.env = envObj;
+        const res = g.ipc.send({ f: "process.spawnSync", command: interpreter, args: spawnArgs, options: spawnOpts });
+        if (res.error) {
+          return failure(`${interpreter}: ${res.error}\n`, 127);
+        }
+        const value = res.value as { stdout?: number[]; stderr?: number[]; status?: number } | undefined;
+        const bytesToStr = (bs: number[] | undefined): string => {
+          if (!bs || bs.length === 0) return "";
+          let s = "";
+          for (let i = 0; i < bs.length; i++) s += String.fromCharCode(bs[i]! & 0xff);
+          return s;
+        };
+        return result(
+          bytesToStr(value?.stdout),
+          bytesToStr(value?.stderr),
+          value?.status ?? 0,
+        );
+      }
+    }
     if (firstNewline !== -1) {
       content = content.slice(firstNewline + 1);
     }

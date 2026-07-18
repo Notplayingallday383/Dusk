@@ -1,6 +1,7 @@
 import { Duplex } from './node-stream';
 import { EventEmitter } from './node-events';
 import { codes, errnoError } from './node-errors';
+import { Buffer } from './node-buffer';
 
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 
@@ -18,37 +19,62 @@ const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
 const socketsById = new Map<number, Socket>();
 const serversById = new Map<number, Server>();
 
-// Engine-global hook used by the host dispatch to deliver net events.
-(globalThis as Record<string, unknown>)['__net'] = {
-  dispatch(event: 'connection' | 'data' | 'end' | 'error' | 'connect',
-           socketId: number, payload?: unknown): void {
-    if (event === 'connection') {
-      const serverId = socketId;
-      const srv = serversById.get(serverId);
-      if (!srv) return;
-      const clientSocketId = (payload as { clientSocketId: number }).clientSocketId;
-      const sock = new Socket({ _existingId: clientSocketId, _existingRemote: 'incoming' });
-      socketsById.set(clientSocketId, sock);
-      sock._markConnected('incoming', 0);
-      srv.emit('connection', sock);
-      return;
-    }
-    const sock = socketsById.get(socketId);
-    if (!sock) return;
-    if (event === 'data') {
-      const bytes = payload as number[];
-      sock.push(Uint8Array.from(bytes));
-    } else if (event === 'end') {
-      sock.push(null);
-    } else if (event === 'error') {
-      const err = new Error(payload as string);
-      sock.destroy(err);
-    } else if (event === 'connect') {
-      const info = payload as { remoteAddress: string; remotePort: number };
-      sock._markConnected(info.remoteAddress, info.remotePort);
-    }
-  },
+interface NodeActiveHandles {
+  count: number;
+  waiters: Set<() => void>;
+}
+
+const nodeActiveHandles = (): NodeActiveHandles => {
+  const global = globalThis as Record<string, unknown>;
+  let state = global['__nodeActiveHandles'] as NodeActiveHandles | undefined;
+  if (!state) {
+    state = { count: 0, waiters: new Set() };
+    global['__nodeActiveHandles'] = state;
+  }
+  return state;
 };
+
+const retainNodeHandle = (): void => { nodeActiveHandles().count++; };
+const releaseNodeHandle = (): void => {
+  const state = nodeActiveHandles();
+  if (state.count > 0) state.count--;
+  if (state.count !== 0) return;
+  for (const resolve of [...state.waiters]) resolve();
+  state.waiters.clear();
+};
+
+// Engine-global hook used by the host dispatch to deliver net events.
+// Registered via the shared net-router so it coexists with the fetch/WS
+// dispatcher in world/net.ts instead of overwriting it.
+import { registerSocketDispatch } from './net-router';
+
+registerSocketDispatch((event: string, socketId: number, payload?: unknown): void => {
+  if (event === 'connection') {
+    const serverId = socketId;
+    const srv = serversById.get(serverId);
+    if (!srv) return;
+    const clientSocketId = (payload as { clientSocketId: number }).clientSocketId;
+    const sock = new Socket({ _existingId: clientSocketId, _existingRemote: 'incoming' });
+    socketsById.set(clientSocketId, sock);
+    sock._markConnected('incoming', 0);
+    srv.emit('connection', sock);
+    return;
+  }
+  const sock = socketsById.get(socketId);
+  if (!sock) return;
+  if (event === 'data') {
+    const bytes = payload as number[];
+    sock.push(Buffer.from(bytes));
+  } else if (event === 'end') {
+    sock.push(null);
+  } else if (event === 'error') {
+    const err = new Error(payload as string);
+    sock.destroy(err);
+  } else if (event === 'connect') {
+    const info = payload as { remoteAddress: string; remotePort: number };
+    sock._markConnected(info.remoteAddress, info.remotePort);
+  }
+});
 
 export interface SocketOpts {
   _existingId?: number;
@@ -171,6 +197,10 @@ export class Socket extends Duplex {
 
 export class Server extends EventEmitter {
   private _serverId = -1;
+  private _host = '0.0.0.0';
+  private _port = 0;
+  private _activeHandle = false;
+  private _refed = true;
   listening = false;
   private _onConnection?: (sock: Socket) => void;
 
@@ -194,10 +224,16 @@ export class Server extends EventEmitter {
       }
     }
     try {
-      const v = __call('net.listen', { host, port }) as { serverId: number };
+      const v = __call('net.listen', { host, port }) as { serverId: number; address: string; port: number };
       this._serverId = v.serverId;
+      this._host = v.address;
+      this._port = v.port;
       serversById.set(this._serverId, this);
       this.listening = true;
+      if (this._refed && !this._activeHandle) {
+        this._activeHandle = true;
+        retainNodeHandle();
+      }
       Promise.resolve().then(() => {
         this.emit('listening');
         if (cb) cb();
@@ -213,6 +249,10 @@ export class Server extends EventEmitter {
       try { __call('net.unlisten', { serverId: this._serverId }); } catch { /* */ }
       serversById.delete(this._serverId);
       this.listening = false;
+      if (this._activeHandle) {
+        this._activeHandle = false;
+        releaseNodeHandle();
+      }
       Promise.resolve().then(() => {
         this.emit('close');
         if (cb) cb();
@@ -225,11 +265,26 @@ export class Server extends EventEmitter {
 
   address(): { port: number; address: string; family: string } | null {
     if (!this.listening) return null;
-    return { port: 0, address: '0.0.0.0', family: 'IPv4' };
+    return { port: this._port, address: this._host, family: 'IPv4' };
   }
 
-  ref(): this { return this; }
-  unref(): this { return this; }
+  ref(): this {
+    this._refed = true;
+    if (this.listening && !this._activeHandle) {
+      this._activeHandle = true;
+      retainNodeHandle();
+    }
+    return this;
+  }
+
+  unref(): this {
+    this._refed = false;
+    if (this._activeHandle) {
+      this._activeHandle = false;
+      releaseNodeHandle();
+    }
+    return this;
+  }
 }
 
 export const createServer = (opts?: { allowHalfOpen?: boolean } | ((sock: Socket) => void), onConn?: (sock: Socket) => void): Server => {

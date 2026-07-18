@@ -30,6 +30,18 @@ export interface SpawnSyncResult {
     stderr: Uint8Array;
     status: number;
 }
+export interface RelaySocket {
+    onData(cb: (data: Uint8Array) => void): () => void;
+    onClose(cb: (reason: number) => void): () => void;
+    send(data: Uint8Array): void;
+    close(reason?: number): void;
+}
+export interface RelayListener {
+    registerListener(host: string, port: number, handler: (socket: RelaySocket) => void): () => void;
+}
+export interface ProcessManagerOptions {
+    relay?: RelayListener;
+}
 export declare class ProcessManager {
     private fs;
     private netFuncs;
@@ -37,6 +49,9 @@ export declare class ProcessManager {
     private processes;
     private nextPid;
     private socketRegistry;
+    private relay;
+    private relayServers;
+    private relaySockets;
     private streamRegistryImpl;
     get streamRegistry(): StreamRegistry;
     private ptyManager;
@@ -44,7 +59,10 @@ export declare class ProcessManager {
     private fdTables;
     private getOrCreateFDTable;
     private lazyLoaders;
-    constructor(fs: FSBackend, netFuncs?: FuncTable, extraFuncs?: FuncTable);
+    constructor(fs: FSBackend, netFuncs?: FuncTable, extraFuncs?: FuncTable, options?: ProcessManagerOptions);
+    private closeRelaySocket;
+    private unregisterRelayServer;
+    private cleanupNetworkForPid;
     registerBinary(name: string, jsSource: string): void;
     registerLazyBinary(name: string, loader: () => Promise<string>): void;
     private maybeElideJshWrapper;
@@ -54,6 +72,7 @@ export declare class ProcessManager {
     listBinaries(): string[];
     hasBinary(name: string): boolean;
     getBinarySource(name: string): string | undefined;
+    loadBinarySource(name: string): Promise<string | undefined>;
     getStreamRegistry(): StreamRegistry;
     getPtyManager(): PtyManager;
     getProcessRecord(pid: number): {

@@ -4,10 +4,7 @@ import { bootRepl } from '../src/index';
 // Note: plan's original test code used `new TextDecoder().decode(chunk)`, but
 // TextDecoder is not defined in this SpiderMonkey engine build. Using
 // `String(chunk)` instead — Buffer's toString override yields utf8 text.
-// loopback http round-trip depends on net loopback data delivery, which is not
-// functional in memory-fs mode — see node-net-loopback.test.ts skip note and
-// src/host/process-manager.ts:1187.
-test.skip('node:http createServer + http.get loopback round-trip', async () => {
+test('node:http createServer + http.get loopback round-trip', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
   await repl.feed(

@@ -55,6 +55,35 @@ export interface SpawnSyncResult {
   status: number;
 }
 
+export interface RelaySocket {
+  onData(cb: (data: Uint8Array) => void): () => void;
+  onClose(cb: (reason: number) => void): () => void;
+  send(data: Uint8Array): void;
+  close(reason?: number): void;
+}
+
+export interface RelayListener {
+  registerListener(host: string, port: number, handler: (socket: RelaySocket) => void): () => void;
+}
+
+export interface ProcessManagerOptions {
+  relay?: RelayListener;
+}
+
+interface RelaySocketRecord {
+  socket: RelaySocket;
+  serverId: number;
+  pid: number;
+  offData: () => void;
+  offClose: () => void;
+}
+
+interface RelayServerRecord {
+  pid: number;
+  dispose: () => void;
+  socketIds: Set<number>;
+}
+
 interface ProcessRecord {
   pid: number;
   ppid: number;
@@ -301,6 +330,9 @@ export class ProcessManager {
   private processes = new Map<number, ProcessRecord>();
   private nextPid = 1;
   private socketRegistry: SocketRegistry = createSocketRegistry();
+  private relay: RelayListener | undefined;
+  private relayServers = new Map<number, RelayServerRecord>();
+  private relaySockets = new Map<number, RelaySocketRecord>();
   private streamRegistryImpl: StreamRegistry = createStreamRegistry();
 
   public get streamRegistry(): StreamRegistry {
@@ -323,9 +355,15 @@ export class ProcessManager {
   // only needed if the user explicitly invokes /bin/{sqlite3,python3}.
   private lazyLoaders: Map<string, () => Promise<string>> = new Map();
 
-  constructor(fs: FSBackend, netFuncs: FuncTable = {}, extraFuncs: FuncTable = {}) {
+  constructor(
+    fs: FSBackend,
+    netFuncs: FuncTable = {},
+    extraFuncs: FuncTable = {},
+    options: ProcessManagerOptions = {},
+  ) {
     this.fs = fs;
     this.netFuncs = { ...netFuncs, ...extraFuncs };
+    this.relay = options.relay;
     // /bin/dsh (Dusk SHell) is the canonical shell. /bin/sh and /bin/jsh
     // are aliases so scripts using shebang `#!/bin/sh` and existing
     // demos/tests that reference /bin/jsh keep working.
@@ -367,6 +405,37 @@ export class ProcessManager {
       (await import('./dpm-bundles/pnpm-bundle.js?raw')).default);
     for (const [name, src] of Object.entries(BUILTIN_BINARIES)) {
       this.registerBinary(name, src);
+    }
+  }
+
+  private closeRelaySocket(socketId: number, closeTransport: boolean, reason?: number): void {
+    const record = this.relaySockets.get(socketId);
+    if (!record) return;
+    this.relaySockets.delete(socketId);
+    this.relayServers.get(record.serverId)?.socketIds.delete(socketId);
+    this.socketRegistry.removePair(socketId);
+    record.offData();
+    record.offClose();
+    if (closeTransport) record.socket.close(reason);
+  }
+
+  private unregisterRelayServer(serverId: number): void {
+    const record = this.relayServers.get(serverId);
+    if (!record) return;
+    this.relayServers.delete(serverId);
+    record.dispose();
+    for (const socketId of [...record.socketIds]) this.closeRelaySocket(socketId, true);
+  }
+
+  private cleanupNetworkForPid(pid: number): void {
+    for (const [serverId, record] of [...this.relayServers]) {
+      if (record.pid === pid) {
+        this.unregisterRelayServer(serverId);
+        this.socketRegistry.unregisterServer(serverId);
+      }
+    }
+    for (const [socketId, record] of [...this.relaySockets]) {
+      if (record.pid === pid) this.closeRelaySocket(socketId, true);
     }
   }
 
@@ -439,6 +508,10 @@ export class ProcessManager {
     // been forced yet. Callers that need the source should go through
     // spawn/spawnSync (which awaits resolveBinary internally).
     return this.binaries.get(name);
+  }
+
+  async loadBinarySource(name: string): Promise<string | undefined> {
+    return this.resolveBinary(name);
   }
 
   getStreamRegistry(): StreamRegistry {
@@ -589,6 +662,11 @@ export class ProcessManager {
     };
     const funcs: FuncTable = { ...baseFuncs, ...this.buildFuncs(0), ...consoleFuncs, ...writeFunc, ...spawnFuncs };
     const engine = await createEngine(0, funcs);
+    const terminate = engine.terminate.bind(engine);
+    engine.terminate = async (): Promise<number> => {
+      this.cleanupNetworkForPid(0);
+      return terminate();
+    };
     dispatchHolder.dispatch = engine.dispatch;
     this.dispatchByPid.set(0, engine.dispatch);
 
@@ -769,6 +847,7 @@ export class ProcessManager {
     const exitPromise = (async (): Promise<number> => {
       void engine.run(entryJs);
       const code = await engine.exited;
+      this.cleanupNetworkForPid(pid);
       this.dispatchByPid.delete(pid);
       // engine.exited resolves after the worker has processed all queued messages,
       // so any proc.write from the world before process.exit has already enqueued
@@ -888,6 +967,7 @@ export class ProcessManager {
 
     void engine.run(entryJs);
     const status = await engine.exited;
+    this.cleanupNetworkForPid(pid);
     const _rec = this.processes.get(pid);
     if (_rec) this._emitChildExit(_rec, status);
     const tbl = this.fdTables.get(pid);
@@ -1555,13 +1635,65 @@ export class ProcessManager {
         const host = (m['host'] as string | undefined) ?? '0.0.0.0';
         const port = (m['port'] as number) | 0;
         const callerPid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-        const serverId = reg.registerServer(host, port, callerPid, (clientSocketId) => {
-          dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('connection', ${serverId}, { clientSocketId: ${clientSocketId} });`);
-        });
-        send({ value: { serverId } });
+        let serverId = -1;
+        try {
+          const registered = reg.registerServer(host, port, callerPid, (clientSocketId) => {
+            dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('connection', ${serverId}, { clientSocketId: ${clientSocketId} });`);
+          });
+          serverId = registered.id;
+          const boundHost = registered.host;
+          const boundPort = registered.port;
+          const relayEligible = this.relay
+            && boundHost !== '0.0.0.0'
+            && boundHost !== '127.0.0.1'
+            && boundHost !== 'localhost'
+            && boundHost !== '::1';
+          if (relayEligible) {
+            const relayRecord: RelayServerRecord = { pid: callerPid, dispose: () => {}, socketIds: new Set() };
+            relayRecord.dispose = this.relay!.registerListener(boundHost, boundPort, (socket) => {
+              const server = reg.findServer(boundHost, boundPort);
+              if (!server) {
+                socket.close();
+                return;
+              }
+              const socketId = reg.allocateSocketId();
+              const record: RelaySocketRecord = {
+                socket,
+                serverId,
+                pid: callerPid,
+                offData: () => {},
+                offClose: () => {},
+              };
+              record.offData = socket.onData((data) => {
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(Array.from(data))});`);
+              });
+              record.offClose = socket.onClose((_reason) => {
+                // The relay contract has no separate error callback. Any remote
+                // close reason therefore maps to one orderly node:net end event.
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${socketId});`);
+                this.closeRelaySocket(socketId, false);
+              });
+              this.relaySockets.set(socketId, record);
+              relayRecord.socketIds.add(socketId);
+              reg.setPair(socketId, {
+                pushToClient: (data) => socket.send(data),
+                closeClient: () => this.closeRelaySocket(socketId, true),
+                errorClient: () => this.closeRelaySocket(socketId, true, 1),
+              });
+              server.onConnection(socketId);
+            });
+            this.relayServers.set(serverId, relayRecord);
+          }
+          send({ value: { serverId, address: boundHost, port: boundPort } });
+        } catch (e) {
+          if (serverId !== -1) reg.unregisterServer(serverId);
+          send({ error: e instanceof Error ? e.message : String(e) });
+        }
       },
       'net.unlisten': (m, send) => {
-        reg.unregisterServer(m['serverId'] as number);
+        const serverId = m['serverId'] as number;
+        this.unregisterRelayServer(serverId);
+        reg.unregisterServer(serverId);
         send({ value: true });
       },
       'net.hasLoopback': (m, send) => {
@@ -1726,6 +1858,7 @@ export class ProcessManager {
             void workerEngine.run(workerJs);
             // Wire exit dispatch back to parent
             void workerEngine.exited.then((code) => {
+              this.cleanupNetworkForPid(workerPid);
               this.processes.delete(workerPid);
               this.dispatchByPid.delete(workerPid);
               const parentDispatch = dispatchByPid.get(parentPid);

@@ -1,4 +1,8 @@
-import { ProcessManager, type DuskProcessHandle } from './host/process-manager';
+import {
+  ProcessManager,
+  type DuskProcessHandle,
+  type RelayListener,
+} from './host/process-manager';
 import { createNet, type LibCurl } from './host/net';
 import { createMemoryBackend, createTfsBackend, type FSBackend } from './host/fs-backend';
 import { createLayoutBackend } from './host/fs-layout';
@@ -10,14 +14,19 @@ import type { EngineInstance, FuncTable } from './host/engine-instance';
 export { createRunner } from './host/runner';
 export { createEngine } from './host/engine-instance';
 export { ProcessManager } from './host/process-manager';
+export type { RelayListener, RelaySocket } from './host/process-manager';
 export { startRepl } from './repl/repl';
 export { createMemoryBackend, createTfsBackend } from './host/fs-backend';
 export { createLayoutBackend } from './host/fs-layout';
 export { initEnginePool, isPoolWarm } from './host/engine-pool';
 export { prewarmEngine } from './engine/spidermonkey';
 
+export type BootReplNetOptions =
+  | { loadLibcurl: () => Promise<LibCurl>; proxyUrl: string; relay?: RelayListener }
+  | { relay: RelayListener; loadLibcurl?: never; proxyUrl?: never };
+
 export interface BootReplOptions {
-  net?: { loadLibcurl: () => Promise<LibCurl>; proxyUrl: string };
+  net?: BootReplNetOptions;
   seed?: Record<string, string>;
   fs?: 'tfs' | 'memory';
   user?: string;
@@ -69,7 +78,7 @@ export const bootRepl = async (
 
   const engineHolder: { engine: EngineInstance | null } = { engine: null };
   let netFuncs: FuncTable = {};
-  if (options?.net) {
+  if (options?.net?.loadLibcurl) {
     const net = createNet(
       options.net.loadLibcurl,
       (js) => { if (engineHolder.engine) engineHolder.engine.dispatch(js); },
@@ -80,13 +89,14 @@ export const bootRepl = async (
 
   let backend: FSBackend;
   let pm: ProcessManager;
+  const processManagerOptions = options?.net?.relay ? { relay: options.net.relay } : {};
   // sqlite/python bridges get the same FSBackend the process manager sees.
   // We build them AFTER pm construction (see below) once `backend` is bound.
   let extraFuncs: FuncTable = {};
   if (useLayout) {
     const ephemeral = createMemoryBackend();
     // Build pm with persistent first (so binaries get registered), then swap to layout
-    pm = new ProcessManager(persistent, netFuncs);
+    pm = new ProcessManager(persistent, netFuncs, {}, processManagerOptions);
     backend = await createLayoutBackend({
       ephemeral,
       persistent,
@@ -97,7 +107,7 @@ export const bootRepl = async (
     (pm as unknown as { fs: FSBackend }).fs = backend;
   } else {
     backend = persistent;
-    pm = new ProcessManager(backend, netFuncs);
+    pm = new ProcessManager(backend, netFuncs, {}, processManagerOptions);
   }
   // Register sqlite and python IPC bridges against the effective backend.
   // Merge into the pm's netFuncs bag so all subsequent spawns see them.
@@ -185,16 +195,3 @@ export const bootRepl = async (
   const repl = startRepl(engine, write);
   return { feed: repl.feed, processManager: pm, engine };
 };
-
-if (typeof document !== 'undefined' && import.meta.env?.MODE !== 'test') {
-  void (async () => {
-    const params = new URLSearchParams(location.search);
-    if (params.get('demo') === 'scripted') {
-      const { startScripted } = await import('./demo/scripted');
-      await startScripted();
-    } else {
-      const { startPage } = await import('./demo/page');
-      await startPage();
-    }
-  })();
-}
