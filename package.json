@@ -5,13 +5,16 @@
   "type": "module",
   "license": "Apache-2.0",
   "author": "NightNetwork",
+  "maintainers": [
+    "NightNetwork"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/nicholasgasior/nightnetwork-dusk"
+    "url": "https://github.com/Night-N3twork/Dusk.git"
   },
-  "homepage": "https://github.com/nicholasgasior/nightnetwork-dusk#readme",
+  "homepage": "https://github.com/Night-N3twork/Dusk#readme",
   "bugs": {
-    "url": "https://github.com/nicholasgasior/nightnetwork-dusk/issues"
+    "url": "https://github.com/Night-N3twork/Dusk/issues"
   },
   "publishConfig": {
     "access": "public"
