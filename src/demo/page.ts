@@ -192,6 +192,51 @@ const PYTHON_EXAMPLES: string[] = [
   'python -c "print(\'via python alias\')"',
 ];
 
+// C and C++ via YoWASP Clang - Real LLVM/Clang 22.1.0 compiler!
+// ~100MB download on first use (one-time, cached after). Compiles real C/C++ programs.
+// Examples use file-based approach to avoid shell quoting hell.
+const C_EXAMPLES: string[] = [
+  // ═══ C Examples ═══
+  'c --version',
+  'c --help',
+  
+  // Hello World
+  'echo "#include <stdio.h>" > /tmp/hello.c && echo "int main() { printf(\\"Hello from real Clang!\\\\n\\"); return 0; }" >> /tmp/hello.c && c /tmp/hello.c',
+  
+  // Functions (impossible with old interpreter!)
+  'echo "#include <stdio.h>" > /tmp/f.c && echo "int add(int a, int b) { return a + b; }" >> /tmp/f.c && echo "int main() { printf(\\"5+3=%d\\\\n\\", add(5,3)); return 0; }" >> /tmp/f.c && c /tmp/f.c',
+  
+  // Pointers (impossible with old interpreter!)
+  'echo "#include <stdio.h>" > /tmp/p.c && echo "int main() { int x=42; int *p=&x; printf(\\"*p=%d\\\\n\\", *p); return 0; }" >> /tmp/p.c && c /tmp/p.c',
+  
+  // Structs (impossible with old interpreter!)
+  'echo "#include <stdio.h>" > /tmp/s.c && echo "struct Point{int x,y;};" >> /tmp/s.c && echo "int main(){struct Point p={10,20}; printf(\\"(%d,%d)\\\\n\\",p.x,p.y); return 0;}" >> /tmp/s.c && c /tmp/s.c',
+  
+  // Arrays
+  'echo "#include <stdio.h>" > /tmp/a.c && echo "int main(){int a[5]={1,2,3,4,5}; int sum=0; for(int i=0;i<5;i++)sum+=a[i]; printf(\\"sum=%d\\\\n\\",sum); return 0;}" >> /tmp/a.c && c /tmp/a.c',
+  
+  // Recursion - Factorial
+  'echo "#include <stdio.h>" > /tmp/fact.c && echo "int fact(int n){return n<=1?1:n*fact(n-1);}" >> /tmp/fact.c && echo "int main(){printf(\\"7!=%d\\\\n\\",fact(7));return 0;}" >> /tmp/fact.c && c /tmp/fact.c',
+  
+  // Math library
+  'echo "#include <stdio.h>" > /tmp/m.c && echo "#include <math.h>" >> /tmp/m.c && echo "int main(){printf(\\"sqrt(144)=%.0f\\\\n\\",sqrt(144));return 0;}" >> /tmp/m.c && c /tmp/m.c',
+  
+  // String functions
+  'echo "#include <stdio.h>" > /tmp/str.c && echo "#include <string.h>" >> /tmp/str.c && echo "int main(){printf(\\"len=%d\\\\n\\",strlen(\\"Clang22\\"));return 0;}" >> /tmp/str.c && c /tmp/str.c',
+  
+  // ═══ C++ Examples (BONUS!) ═══
+  'c++ --version',
+  
+  // C++ Hello World with iostream
+  'echo "#include <iostream>" > /tmp/hello.cpp && echo "int main() { std::cout << \\"Hello C++!\\" << std::endl; return 0; }" >> /tmp/hello.cpp && c++ /tmp/hello.cpp',
+  
+  // C++ with std::vector
+  'echo "#include <iostream>" > /tmp/vec.cpp && echo "#include <vector>" >> /tmp/vec.cpp && echo "int main(){std::vector<int> v={1,2,3}; std::cout<<v.size()<<std::endl; return 0;}" >> /tmp/vec.cpp && c++ /tmp/vec.cpp',
+  
+  // C++ with classes
+  'echo "#include <iostream>" > /tmp/class.cpp && echo "class Cat{public: void meow(){std::cout<<\\"Meow!\\"<<std::endl;}};" >> /tmp/class.cpp && echo "int main(){Cat c; c.meow(); return 0;}" >> /tmp/class.cpp && c++ /tmp/class.cpp',
+];
+
 export const startPage = async (): Promise<void> => {
   const out = document.getElementById('out') as HTMLPreElement;
   const line = document.getElementById('line') as HTMLInputElement;
@@ -200,6 +245,7 @@ export const startPage = async (): Promise<void> => {
   const cryptoExamples = document.getElementById('crypto-examples') as HTMLDivElement;
   const sqliteExamples = document.getElementById('sqlite-examples') as HTMLDivElement;
   const pythonExamples = document.getElementById('python-examples') as HTMLDivElement;
+  const cExamples = document.getElementById('c-examples') as HTMLDivElement;
   const fsview = document.getElementById('fsview') as HTMLPreElement;
   const clearfs = document.getElementById('clearfs') as HTMLButtonElement;
 
@@ -314,5 +360,11 @@ export const startPage = async (): Promise<void> => {
     btn.textContent = ex;
     btn.addEventListener('click', () => { void submit(ex); });
     pythonExamples.appendChild(btn);
+  }
+  for (const ex of C_EXAMPLES) {
+    const btn = document.createElement('button');
+    btn.textContent = ex;
+    btn.addEventListener('click', () => { void submit(ex); });
+    cExamples.appendChild(btn);
   }
 };

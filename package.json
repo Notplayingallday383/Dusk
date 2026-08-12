@@ -47,16 +47,17 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@nightnetwork/nova": "1.0.0",
     "@terbiumos/tfs": "^1.0.24",
     "@wasmer/wasi": "^0.12.0",
     "@wasmer/wasmfs": "^0.12.0",
+    "@yowasp/clang": "^22.0.0-git20542-10",
     "diff": "^9.0.0",
     "fast-xml-parser": "^5.9.3",
     "file-type": "^22.0.1",
     "ini": "^7.0.0",
     "libcurl.js": "0.7.4",
     "minimatch": "^10.2.5",
-    "@nightnetwork/nova": "1.0.0",
     "papaparse": "^5.5.4",
     "pyodide": "^314.0.2",
     "re2js": "^2.8.5",
@@ -69,10 +70,10 @@
     "@types/sql.js": "^1.4.11",
     "@vitest/browser": "^4.1.9",
     "@vitest/browser-playwright": "^4.1.9",
+    "nova-wasm": "file:vendor/nova-wasm",
     "playwright": "^1.49.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0",
-    "vitest": "^4.1.9",
-    "nova-wasm": "file:vendor/nova-wasm"
+    "vitest": "^4.1.9"
   }
 }

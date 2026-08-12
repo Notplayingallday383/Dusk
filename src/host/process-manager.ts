@@ -395,6 +395,8 @@ export class ProcessManager {
     this.registerLazyBinary('/bin/python', loadPython);
     this.registerLazyBinary('/bin/c', async () =>
       '#!/bin/node\n' + (await import('../binaries/c/binary-entry.ts?worldsrc')).default);
+    this.registerLazyBinary('/bin/c++', async () =>
+      '#!/bin/node\n' + (await import('../binaries/cpp/binary-entry.ts?worldsrc')).default);
     this.registerLazyBinary('/bin/dpm', async () =>
       (await import('./dpm-bundles/dpm-bundle.js?raw')).default);
     this.registerLazyBinary('/bin/dpx', async () =>

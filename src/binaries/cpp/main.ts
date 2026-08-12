@@ -1,14 +1,7 @@
-// /bin/c — C interpreter on the host.
+// /bin/c++ — C++ compiler on the host (Clang via YoWASP)
 //
-// Usage:
-//   c -c "printf(\"hi\");"           inline code
-//   c script.c [args...]             run TFS-resident script
-//   c -                              read code from stdin
-//   echo 'printf("1");' | c          same
-//   c --version
-//
-// Heavy lifting (C interpretation) is done on the host; see src/host/c-interpreter.ts.
-// TFS integration: scripts are read from TFS and executed.
+// This is essentially the same as /bin/c but uses clang++ for C++ compilation.
+// Shares the same Clang WASM backend, just changes the compiler mode.
 
 type ProcessGlobal = {
   argv: string[];
@@ -81,7 +74,7 @@ export const main = async (): Promise<number> => {
     if (a === '--help' || a === '-h') { showHelp = true; i = argv.length; break; }
     if (a === '-') { readStdin = true; for (let j = i + 1; j < argv.length; j++) scriptArgs.push(argv[j]!); break; }
     if (a.startsWith('-') && a.length > 1) {
-      proc.stderr.write('c: unrecognized option: ' + a + '\n');
+      proc.stderr.write('c++: unrecognized option: ' + a + '\n');
       if (proc.exit) proc.exit(2);
       return 2;
     }
@@ -92,23 +85,23 @@ export const main = async (): Promise<number> => {
 
   if (showHelp) {
     proc.stdout.write([
-      'c — C/C++ Compiler (Clang 22.1.0 via YoWASP)',
-      'Usage: c [OPTIONS] [-c CODE | SCRIPT | -] [args...]',
-      '  -c CODE      Execute CODE as C',
+      'c++ — C++ Compiler (Clang 22.1.0 via YoWASP)',
+      'Usage: c++ [OPTIONS] [-c CODE | SCRIPT | -] [args...]',
+      '  -c CODE      Execute CODE as C++',
       '  -            Read script from stdin',
-      '  SCRIPT       Path in TFS to a .c file',
+      '  SCRIPT       Path in TFS to a .cpp file',
       '  --version    Print compiler version and exit',
       '  --help       Print this help',
       '',
       'First compilation downloads ~100MB compiler (one-time, cached after).',
       '',
-      'Full C11/C++17 support:',
-      '  - Complete standard library (stdio, stdlib, string, math, etc.)',
-      '  - Pointers and dynamic memory (malloc/free)',
-      '  - Structs, unions, enums',
-      '  - Custom function definitions',
-      '  - Arrays and pointer arithmetic',
-      '  - Can compile real C programs from textbooks, GitHub, etc.',
+      'Full C++17 support:',
+      '  - Complete standard library (iostream, vector, algorithm, etc.)',
+      '  - Templates and STL',
+      '  - Classes and inheritance',
+      '  - Smart pointers and RAII',
+      '  - Lambda expressions',
+      '  - Can compile real C++ programs from books, GitHub, etc.',
       '',
       'Powered by LLVM/Clang WebAssembly',
       '',
@@ -124,7 +117,7 @@ export const main = async (): Promise<number> => {
       if (proc.exit) proc.exit(0);
       return 0;
     } catch (e) {
-      proc.stderr.write('c: ' + (e instanceof Error ? e.message : String(e)) + '\n');
+      proc.stderr.write('c++: ' + (e instanceof Error ? e.message : String(e)) + '\n');
       if (proc.exit) proc.exit(1);
       return 1;
     }
@@ -134,7 +127,7 @@ export const main = async (): Promise<number> => {
   if (inlineCode === null && scriptPath === null && !readStdin) {
     const piped = readStdinAll();
     if (piped.trim().length > 0) {
-      const r = call('clang.compile', { code: piped, filename: 'stdin.c' }) as { stdout: string; stderr: string; exitCode: number; success: boolean };
+      const r = call('clang.compile', { code: piped, filename: 'stdin.cpp' }) as { stdout: string; stderr: string; exitCode: number; success: boolean };
       if (r.stdout) proc.stdout.write(r.stdout);
       if (r.stderr) proc.stderr.write(r.stderr);
       const code = r.exitCode ?? (r.success ? 0 : 1);
@@ -142,7 +135,7 @@ export const main = async (): Promise<number> => {
       return code;
     }
     // No piped input and no args - show help
-    proc.stderr.write('c: no input provided. Use -h for help.\n');
+    proc.stderr.write('c++: no input provided. Use -h for help.\n');
     if (proc.exit) proc.exit(1);
     return 1;
   }
@@ -159,14 +152,14 @@ export const main = async (): Promise<number> => {
     // scriptPath !== null
     const fs = getFs();
     if (!fs) {
-      proc.stderr.write('c: __fs unavailable\n');
+      proc.stderr.write('c++: __fs unavailable\n');
       if (proc.exit) proc.exit(1);
       return 1;
     }
     try {
       code = fs.readFile(scriptPath!);
     } catch (e) {
-      proc.stderr.write("c: can't open file '" + scriptPath + "': " + (e instanceof Error ? e.message : String(e)) + '\n');
+      proc.stderr.write("c++: can't open file '" + scriptPath + "': " + (e instanceof Error ? e.message : String(e)) + '\n');
       if (proc.exit) proc.exit(2);
       return 2;
     }
@@ -176,7 +169,7 @@ export const main = async (): Promise<number> => {
   try {
     const r = call('clang.compile', {
       code,
-      filename: displayName,
+      filename: displayName.endsWith('.cpp') ? displayName : displayName + '.cpp',
     }) as { stdout: string; stderr: string; exitCode: number; success: boolean };
     if (r.stdout) proc.stdout.write(r.stdout);
     if (r.stderr) proc.stderr.write(r.stderr);
@@ -184,7 +177,7 @@ export const main = async (): Promise<number> => {
     if (proc.exit) proc.exit(exitCode);
     return exitCode;
   } catch (e) {
-    proc.stderr.write('c: ' + (e instanceof Error ? e.message : String(e)) + '\n');
+    proc.stderr.write('c++: ' + (e instanceof Error ? e.message : String(e)) + '\n');
     if (proc.exit) proc.exit(1);
     return 1;
   }
