@@ -1,6 +1,7 @@
 import { build } from 'esbuild';
 import type { Plugin } from 'vite';
 import pkg from './package.json';
+import { fileURLToPath } from 'node:url';
 
 // Aliases for third-party modules that don't resolve inside the DuskJS engine.
 // The just-bash browser bundle imports node:zlib (for gzip/gunzip/zcat) and
@@ -8,7 +9,10 @@ import pkg from './package.json';
 // runtime-throwing shims so the bundle links but calling those specific
 // commands surfaces a clear error message.
 // URLs constructed against import.meta.url so this works under bundler + ESM.
-const shimUrl = (name: string): string => new URL('./src/binaries/dsh/shims/' + name, import.meta.url).pathname;
+const shimUrl = (name: string): string => {
+  const fileUrl = new URL('./src/binaries/dsh/shims/' + name, import.meta.url);
+  return fileURLToPath(fileUrl);
+};
 const ENGINE_ALIASES: Record<string, string> = {
   'node:zlib': shimUrl('zlib-stub.js'),
   'node:dns': shimUrl('dns-stub.js'),
