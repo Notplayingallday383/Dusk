@@ -388,11 +388,13 @@ export class ProcessManager {
     // Lazy: sqlite3, python3, python alias, dpm/dpx/npm/npx/pnpm.
     // These get their source fetched from a code-split chunk on first spawn.
     this.registerLazyBinary('/bin/sqlite3', async () =>
-      (await import('../binaries/sqlite3/binary-entry.ts?worldsrc')).default);
+      '#!/bin/node\n' + (await import('../binaries/sqlite3/binary-entry.ts?worldsrc')).default);
     const loadPython = async (): Promise<string> =>
-      (await import('../binaries/python3/binary-entry.ts?worldsrc')).default;
+      '#!/bin/node\n' + (await import('../binaries/python3/binary-entry.ts?worldsrc')).default;
     this.registerLazyBinary('/bin/python3', loadPython);
     this.registerLazyBinary('/bin/python', loadPython);
+    this.registerLazyBinary('/bin/c', async () =>
+      '#!/bin/node\n' + (await import('../binaries/c/binary-entry.ts?worldsrc')).default);
     this.registerLazyBinary('/bin/dpm', async () =>
       (await import('./dpm-bundles/dpm-bundle.js?raw')).default);
     this.registerLazyBinary('/bin/dpx', async () =>
@@ -2013,6 +2015,18 @@ export class ProcessManager {
       body = builtin;
     } else {
       body = `(new Function(__fs.readFile(${JSON.stringify(cmd)})))();`;
+    }
+    // Strip a leading shebang line (e.g. "#!/bin/node\n"), if present. `#!` is
+    // only legal JS at position 0 of a script/module; here `body` gets spliced
+    // into the middle of an async IIFE below, so a leading shebang would be a
+    // syntax error inside the sandboxed eval — which gets silently swallowed
+    // by the world's dispatch loop, leaving the process hanging forever
+    // instead of surfacing any error. Several lazily-loaded binaries (c,
+    // sqlite3, python/python3) are registered with a `#!/bin/node\n` prefix
+    // purely as documentation/metadata; it carries no executable meaning here.
+    if (body.startsWith('#!')) {
+      const nl = body.indexOf('\n');
+      body = nl === -1 ? '' : body.slice(nl + 1);
     }
 
     // Wrap body in an async IIFE so bundle code that uses fire-and-forget

@@ -8,6 +8,7 @@ import { createMemoryBackend, createTfsBackend, type FSBackend } from './host/fs
 import { createLayoutBackend } from './host/fs-layout';
 import { createSqliteFuncs } from './host/sqlite';
 import { createPythonFuncs } from './host/python';
+import { createCFuncs } from './host/c-interpreter';
 import { startRepl, type DuskRepl } from './repl/repl';
 import type { EngineInstance, FuncTable } from './host/engine-instance';
 
@@ -109,9 +110,9 @@ export const bootRepl = async (
     backend = persistent;
     pm = new ProcessManager(backend, netFuncs, {}, processManagerOptions);
   }
-  // Register sqlite and python IPC bridges against the effective backend.
+  // Register sqlite, python, and C IPC bridges against the effective backend.
   // Merge into the pm's netFuncs bag so all subsequent spawns see them.
-  extraFuncs = { ...createSqliteFuncs(backend), ...createPythonFuncs(backend) };
+  extraFuncs = { ...createSqliteFuncs(backend), ...createPythonFuncs(backend), ...createCFuncs(backend) };
   (pm as unknown as { netFuncs: FuncTable }).netFuncs = {
     ...(pm as unknown as { netFuncs: FuncTable }).netFuncs,
     ...extraFuncs,
