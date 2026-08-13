@@ -12,7 +12,7 @@ export default defineConfig({
   },
   plugins: [worldSource()],
   worker: { format: 'es' },
-  optimizeDeps: { include: ['@wasmer/wasi', '@wasmer/wasi/lib/bindings/browser', '@wasmer/wasmfs', 'buffer', '@terbiumos/tfs/browser'], exclude: ['libcurl.js'] },
+  optimizeDeps: { include: ['@wasmer/wasi', '@wasmer/wasi/lib/bindings/browser', '@wasmer/wasmfs', 'buffer', '@terbiumos/tfs/browser'], exclude: ['libcurl.js', '@yowasp/clang'] },
   define: {
     __DUSK_VERSION__: JSON.stringify(pkg.version),
   },

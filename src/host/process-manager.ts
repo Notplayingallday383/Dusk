@@ -393,6 +393,14 @@ export class ProcessManager {
       (await import('../binaries/python3/binary-entry.ts?worldsrc')).default;
     this.registerLazyBinary('/bin/python3', loadPython);
     this.registerLazyBinary('/bin/python', loadPython);
+    // Clang/GCC toolchain: clang, clang++, gcc, g++, cc
+    const loadClang = async (): Promise<string> =>
+      (await import('../binaries/clang/binary-entry.ts?worldsrc')).default;
+    this.registerLazyBinary('/bin/clang', loadClang);
+    this.registerLazyBinary('/bin/clang++', loadClang);
+    this.registerLazyBinary('/bin/gcc', loadClang);
+    this.registerLazyBinary('/bin/g++', loadClang);
+    this.registerLazyBinary('/bin/cc', loadClang);
     this.registerLazyBinary('/bin/dpm', async () =>
       (await import('./dpm-bundles/dpm-bundle.js?raw')).default);
     this.registerLazyBinary('/bin/dpx', async () =>

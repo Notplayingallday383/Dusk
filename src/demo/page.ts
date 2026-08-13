@@ -192,6 +192,39 @@ const PYTHON_EXAMPLES: string[] = [
   'python -c "print(\'via python alias\')"',
 ];
 
+// C/C++ compilation via YoWASP Clang (LLVM toolchain compiled to WASM).
+// First call downloads Clang from CDN and may take a moment.
+// Shows how to write, compile, and link C programs entirely in the browser.
+// Note: Produces WebAssembly binaries. Execution support coming soon!
+const C_EXAMPLES: string[] = [
+  // Check compiler version
+  'clang --version',
+  // Simple hello world: write source and compile
+  'echo \'#include <stdio.h>\nint main() { printf("Hello from C!\\\\n"); return 0; }\' > /tmp/hello.c',
+  'clang /tmp/hello.c -o /tmp/hello.wasm',
+  'ls -lh /tmp/hello.wasm',
+  // View the source we just created
+  'cat /tmp/hello.c',
+  // Slightly more complex: multiple lines with variables
+  'printf \'#include <stdio.h>\\nint main() {\\n  int x = 42;\\n  printf("Answer: %d\\\\n", x);\\n  return 0;\\n}\' > /tmp/answer.c',
+  'clang /tmp/answer.c -o /tmp/answer.wasm',
+  // C++ hello world
+  'echo \'#include <iostream>\nint main() { std::cout << "Hello from C++!" << std::endl; return 0; }\' > /tmp/hello.cpp',
+  'clang++ /tmp/hello.cpp -o /tmp/hello_cpp.wasm',
+  // Using gcc alias (same as clang)
+  'echo \'#include <stdio.h>\nint main() { printf("Via GCC alias\\\\n"); return 0; }\' > /tmp/gcc_test.c',
+  'gcc /tmp/gcc_test.c -o /tmp/gcc_test.wasm',
+  // Compile only (produce .o object file)
+  'echo \'int add(int a, int b) { return a + b; }\' > /tmp/add.c',
+  'clang -c /tmp/add.c -o /tmp/add.o',
+  // Multi-file compilation: separate files, link together
+  'echo \'int add(int a, int b);\nint main() { return add(2, 3); }\' > /tmp/main.c',
+  'echo \'int add(int a, int b) { return a + b; }\' > /tmp/add.c',
+  'clang /tmp/main.c /tmp/add.c -o /tmp/multi.wasm',
+  // Show all compiled outputs
+  'ls -lh /tmp/*.wasm /tmp/*.o 2>/dev/null || echo "Compile something first!"',
+];
+
 export const startPage = async (): Promise<void> => {
   const out = document.getElementById('out') as HTMLPreElement;
   const line = document.getElementById('line') as HTMLInputElement;
@@ -200,6 +233,7 @@ export const startPage = async (): Promise<void> => {
   const cryptoExamples = document.getElementById('crypto-examples') as HTMLDivElement;
   const sqliteExamples = document.getElementById('sqlite-examples') as HTMLDivElement;
   const pythonExamples = document.getElementById('python-examples') as HTMLDivElement;
+  const cExamples = document.getElementById('c-examples') as HTMLDivElement;
   const fsview = document.getElementById('fsview') as HTMLPreElement;
   const clearfs = document.getElementById('clearfs') as HTMLButtonElement;
 
@@ -314,5 +348,11 @@ export const startPage = async (): Promise<void> => {
     btn.textContent = ex;
     btn.addEventListener('click', () => { void submit(ex); });
     pythonExamples.appendChild(btn);
+  }
+  for (const ex of C_EXAMPLES) {
+    const btn = document.createElement('button');
+    btn.textContent = ex;
+    btn.addEventListener('click', () => { void submit(ex); });
+    cExamples.appendChild(btn);
   }
 };

@@ -19,6 +19,7 @@ import { Bash } from '../../vendor/just-bash/Bash';
 import { TfsFs } from './tfs-fs';
 import { sqlite3Command } from './commands/sqlite3-command';
 import { python3Command, pythonCommand } from './commands/python3-command';
+import { clangCommand, clangppCommand, gccCommand, gppCommand, ccCommand } from './commands/clang-command';
 
 type ProcessGlobal = {
   argv: string[];
@@ -436,7 +437,7 @@ export const main = async (): Promise<number> => {
     // Custom DuskJS commands: sqlite3 (via host sql.js bridge), python3 (via
     // host Pyodide bridge). See ./commands/. Each of these routes IPC through
     // the same channel other host funcs use (fs.*, net.*).
-    customCommands: [sqlite3Command, python3Command, pythonCommand],
+    customCommands: [sqlite3Command, python3Command, pythonCommand, clangCommand, clangppCommand, gccCommand, gppCommand, ccCommand],
   });
 
   let code: number;

@@ -29,7 +29,7 @@ const crossOriginIsolation = {
 export default defineConfig({
   plugins: [crossOriginIsolation, worldSource()],
   worker: { format: 'es' },
-  optimizeDeps: { exclude: ['libcurl.js'] },
+  optimizeDeps: { exclude: ['libcurl.js', '@yowasp/clang'] },
   server: { allowedHosts: ['ddxdevtemp.ampscat.dev'] },
   // `npm run preview` serves the built dist/ on port 5173 with COOP/COEP.
   preview: {
