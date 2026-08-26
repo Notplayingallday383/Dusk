@@ -49,6 +49,26 @@ export interface BootReplOptions {
    * Default: false (creates pid-0 for backwards compat).
    */
   skipPidZero?: boolean;
+  /**
+   * Path to a directory containing external binaries in the TFS filesystem.
+   * Binaries in this directory will be automatically registered and made available
+   * for execution. This allows storing custom executables in TFS and running them.
+   * Example: '/usr/local/bin' or '/home/user/bin'
+   */
+  externalBinariesPath?: string;
+  /**
+   * Path to an environment variables file (e.g., '.env' file) in TFS.
+   * The file should contain KEY=VALUE pairs, one per line.
+   * These will be loaded and added to the process environment.
+   * Example: '/home/user/.env' or '/.env'
+   */
+  envFilePath?: string;
+  /**
+   * Path to a bash history file in TFS (e.g., '.bash_history').
+   * Command history will be loaded from and saved to this file.
+   * Example: '/home/user/.bash_history'
+   */
+  historyFilePath?: string;
 }
 
 export interface BootReplResult extends DuskRepl {
@@ -57,6 +77,15 @@ export interface BootReplResult extends DuskRepl {
   engine: EngineInstance;
   /** Present when `via: 'node'` — the spawned /bin/node child handle. */
   node?: DuskProcessHandle;
+  /** History management utilities (if historyFilePath was provided) */
+  history?: {
+    /** Load command history from the history file */
+    load(): Promise<string[]>;
+    /** Append a command to the history file */
+    append(command: string): Promise<void>;
+    /** Save an array of commands to the history file (overwrites existing) */
+    save(commands: string[]): Promise<void>;
+  };
 }
 
 export const bootRepl = async (
@@ -125,6 +154,79 @@ export const bootRepl = async (
     await backend.writeFile(path, contents);
   }
 
+  // Load external binaries from the specified path
+  if (options?.externalBinariesPath) {
+    try {
+      if (await backend.exists(options.externalBinariesPath)) {
+        const files = await backend.readdir(options.externalBinariesPath);
+        for (const file of files) {
+          const fullPath = `${options.externalBinariesPath}/${file}`;
+          const stat = await backend.stat(fullPath);
+          if (stat.isFile) {
+            try {
+              const binarySource = await backend.readFile(fullPath);
+              pm.registerBinary(`/bin/${file}`, binarySource);
+            } catch (e) {
+              console.warn(`Failed to load external binary ${file}:`, e);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load external binaries:', e);
+    }
+  }
+
+  // Load environment variables from file
+  let additionalEnv: Record<string, string> = {};
+  if (options?.envFilePath) {
+    try {
+      if (await backend.exists(options.envFilePath)) {
+        const envContent = await backend.readFile(options.envFilePath);
+        const lines = envContent.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          // Skip comments and empty lines
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const eqIndex = trimmed.indexOf('=');
+          if (eqIndex > 0) {
+            const key = trimmed.slice(0, eqIndex).trim();
+            let value = trimmed.slice(eqIndex + 1).trim();
+            // Remove surrounding quotes if present
+            if ((value.startsWith('"') && value.endsWith('"')) || 
+                (value.startsWith("'") && value.endsWith("'"))) {
+              value = value.slice(1, -1);
+            }
+            additionalEnv[key] = value;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load environment file:', e);
+    }
+  }
+
+  // Add history file path to environment if specified
+  if (options?.historyFilePath) {
+    additionalEnv['HISTFILE'] = options.historyFilePath;
+    // Create history file if it doesn't exist
+    try {
+      if (!(await backend.exists(options.historyFilePath))) {
+        const histDir = options.historyFilePath.split('/').slice(0, -1).join('/');
+        if (histDir && !(await backend.exists(histDir))) {
+          let cur = '';
+          for (const seg of histDir.split('/').filter(Boolean)) {
+            cur += '/' + seg;
+            if (!(await backend.exists(cur))) await backend.mkdir(cur);
+          }
+        }
+        await backend.writeFile(options.historyFilePath, '');
+      }
+    } catch (e) {
+      console.warn('Failed to create history file:', e);
+    }
+  }
+
   // Optionally skip pid-0 — saves ~100MB of RAM by not spawning an entire
   // SpiderMonkey Worker for the `feed()` path. Only meaningful for callers
   // that will never call `.feed()` and only use `processManager.spawn(...)`.
@@ -147,7 +249,7 @@ export const bootRepl = async (
       },
     };
   } else {
-    engine = await pm.createPidZero(netFuncs, write, { user, hostname });
+    engine = await pm.createPidZero(netFuncs, write, { user, hostname, additionalEnv });
     engineHolder.engine = engine;
   }
 
@@ -156,7 +258,7 @@ export const bootRepl = async (
     // proc.readStdin polling in main.ts's startRepl (see binaries/node/main.ts).
     const home = `/home/${user}`;
     const nodeHandle = await pm.spawn('/bin/node', [], {
-      env: { USER: user, HOME: home, PATH: '/bin', PWD: home, HOSTNAME: hostname, SHELL: '/bin/sh', TERM: 'dumb' },
+      env: { USER: user, HOME: home, PATH: '/bin', PWD: home, HOSTNAME: hostname, SHELL: '/bin/sh', TERM: 'dumb', ...additionalEnv },
       cwd: home,
     });
     // Reader loop: decode child stdout/stderr → write().
@@ -180,7 +282,43 @@ export const bootRepl = async (
     const feed = async (line: string): Promise<void> => {
       await nodeHandle.stdin.write(encoder.encode(line + '\n'));
     };
-    return { feed, processManager: pm, engine, node: nodeHandle };
+    
+    // Create history utilities if history file path was provided
+    const history = options?.historyFilePath ? {
+      load: async (): Promise<string[]> => {
+        try {
+          if (await backend.exists(options.historyFilePath!)) {
+            const content = await backend.readFile(options.historyFilePath!);
+            return content.split('\n').filter(line => line.trim().length > 0);
+          }
+        } catch (e) {
+          console.warn('Failed to load history:', e);
+        }
+        return [];
+      },
+      append: async (command: string): Promise<void> => {
+        try {
+          const trimmed = command.trim();
+          if (!trimmed) return;
+          const existing = await backend.exists(options.historyFilePath!) 
+            ? await backend.readFile(options.historyFilePath!) 
+            : '';
+          await backend.writeFile(options.historyFilePath!, existing + trimmed + '\n');
+        } catch (e) {
+          console.warn('Failed to append to history:', e);
+        }
+      },
+      save: async (commands: string[]): Promise<void> => {
+        try {
+          const content = commands.filter(c => c.trim().length > 0).join('\n') + '\n';
+          await backend.writeFile(options.historyFilePath!, content);
+        } catch (e) {
+          console.warn('Failed to save history:', e);
+        }
+      },
+    } : undefined;
+    
+    return { feed, processManager: pm, engine, node: nodeHandle, history };
   }
 
   if (options?.skipPidZero) {
@@ -189,9 +327,81 @@ export const bootRepl = async (
     const feed = async (): Promise<void> => {
       throw new Error('bootRepl: feed() unavailable when skipPidZero:true. Spawn a shell via processManager.spawn(\'/bin/dsh\', ...) and write to its stdin.');
     };
-    return { feed, processManager: pm, engine };
+    
+    // Create history utilities if history file path was provided
+    const history = options?.historyFilePath ? {
+      load: async (): Promise<string[]> => {
+        try {
+          if (await backend.exists(options.historyFilePath!)) {
+            const content = await backend.readFile(options.historyFilePath!);
+            return content.split('\n').filter(line => line.trim().length > 0);
+          }
+        } catch (e) {
+          console.warn('Failed to load history:', e);
+        }
+        return [];
+      },
+      append: async (command: string): Promise<void> => {
+        try {
+          const trimmed = command.trim();
+          if (!trimmed) return;
+          const existing = await backend.exists(options.historyFilePath!) 
+            ? await backend.readFile(options.historyFilePath!) 
+            : '';
+          await backend.writeFile(options.historyFilePath!, existing + trimmed + '\n');
+        } catch (e) {
+          console.warn('Failed to append to history:', e);
+        }
+      },
+      save: async (commands: string[]): Promise<void> => {
+        try {
+          const content = commands.filter(c => c.trim().length > 0).join('\n') + '\n';
+          await backend.writeFile(options.historyFilePath!, content);
+        } catch (e) {
+          console.warn('Failed to save history:', e);
+        }
+      },
+    } : undefined;
+    
+    return { feed, processManager: pm, engine, history };
   }
 
   const repl = startRepl(engine, write);
-  return { feed: repl.feed, processManager: pm, engine };
+  
+  // Create history utilities if history file path was provided
+  const history = options?.historyFilePath ? {
+    load: async (): Promise<string[]> => {
+      try {
+        if (await backend.exists(options.historyFilePath!)) {
+          const content = await backend.readFile(options.historyFilePath!);
+          return content.split('\n').filter(line => line.trim().length > 0);
+        }
+      } catch (e) {
+        console.warn('Failed to load history:', e);
+      }
+      return [];
+    },
+    append: async (command: string): Promise<void> => {
+      try {
+        const trimmed = command.trim();
+        if (!trimmed) return;
+        const existing = await backend.exists(options.historyFilePath!) 
+          ? await backend.readFile(options.historyFilePath!) 
+          : '';
+        await backend.writeFile(options.historyFilePath!, existing + trimmed + '\n');
+      } catch (e) {
+        console.warn('Failed to append to history:', e);
+      }
+    },
+    save: async (commands: string[]): Promise<void> => {
+      try {
+        const content = commands.filter(c => c.trim().length > 0).join('\n') + '\n';
+        await backend.writeFile(options.historyFilePath!, content);
+      } catch (e) {
+        console.warn('Failed to save history:', e);
+      }
+    },
+  } : undefined;
+  
+  return { feed: repl.feed, processManager: pm, engine, history };
 };

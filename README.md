@@ -19,6 +19,9 @@ DuskJS runs a full Node.js-compatible environment inside WebAssembly, in any mod
 - **Nova HTTP client** — Rust-based `libcurl` replacement (nova-wasm) for outbound HTTP/HTTPS
 - **Engine pool** — pre-warmed SpiderMonkey instances for fast process spawning
 - **Signal delivery** — SIGINT, SIGTERM, SIGKILL, SIGCHLD, SIGWINCH, and more
+- **External binaries** — register custom executables from a TFS directory
+- **Environment files** — load environment variables from `.env` files
+- **Command history** — persist shell history to `.bash_history` files
 
 ## Installation
 
@@ -90,6 +93,9 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 | `layout` | `boolean` | `true` | Use the layered filesystem layout (ephemeral + persistent) |
 | `via` | `'startRepl' \| 'node'` | `'startRepl'` | How `feed()` routes input — via the pid-0 engine or a spawned `/bin/node` |
 | `skipPidZero` | `boolean` | `false` | Skip creating the pid-0 engine to save ~100MB RAM |
+| `externalBinariesPath` | `string?` | `undefined` | Path to a TFS directory containing external binaries to register |
+| `envFilePath` | `string?` | `undefined` | Path to a `.env` file in TFS to load environment variables from |
+| `historyFilePath` | `string?` | `undefined` | Path to a history file (e.g., `.bash_history`) in TFS for command history |
 
 **`BootReplResult`:**
 
@@ -99,6 +105,7 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 | `processManager` | `ProcessManager` | Spawn and manage child processes |
 | `engine` | `EngineInstance` | The pid-0 SpiderMonkey engine (stub if `skipPidZero`) |
 | `node` | `DuskProcessHandle?` | Present when `via: 'node'` |
+| `history` | `HistoryUtilities?` | History management utilities (present if `historyFilePath` was provided) |
 
 ### `ProcessManager`
 
@@ -269,6 +276,97 @@ const repl = await bootRepl(write, {
   },
 });
 ```
+
+## External Binaries, Environment Files, and Command History
+
+DuskJS supports loading custom binaries, environment configuration, and command history from the filesystem:
+
+### External Binaries
+
+Register a directory containing custom executable scripts that will be automatically loaded as binaries:
+
+```ts
+const repl = await bootRepl(write, {
+  externalBinariesPath: '/usr/local/bin',
+});
+
+// All files in /usr/local/bin are now available as /bin/<filename>
+await repl.processManager.spawn('my-custom-script', []);
+```
+
+### Environment Files
+
+Load environment variables from a `.env` file:
+
+```ts
+const repl = await bootRepl(write, {
+  envFilePath: '/home/user/.env',
+});
+
+// Variables from .env are now available in process.env
+```
+
+Example `.env` file:
+```env
+# Database settings
+DB_HOST=localhost
+DB_PORT=5432
+
+# API configuration
+API_KEY="secret-key"
+API_URL='https://api.example.com'
+```
+
+### Command History
+
+Persist command history to a file:
+
+```ts
+const repl = await bootRepl(write, {
+  historyFilePath: '/home/user/.bash_history',
+});
+
+// Load previous commands
+const commands = await repl.history.load();
+
+// Append a command to history
+await repl.history.append('ls -la');
+
+// Save history
+await repl.history.save(['echo hello', 'ls -la']);
+```
+
+The history file path is also available via the `HISTFILE` environment variable.
+
+### Complete Example
+
+```ts
+import { bootRepl, createTfsBackend } from '@nightnetwork/dusk';
+
+// Pre-seed the filesystem with custom binaries and config
+const backend = await createTfsBackend();
+await backend.mkdir('/usr/local/bin', true);
+await backend.writeFile('/usr/local/bin/greet', `
+  console.log('Hello, ' + (process.env.USER_NAME || 'World') + '!');
+`);
+await backend.mkdir('/home/user', true);
+await backend.writeFile('/home/user/.env', 'USER_NAME=Alice\nDEBUG=true');
+
+// Boot with all features
+const repl = await bootRepl(write, {
+  externalBinariesPath: '/usr/local/bin',
+  envFilePath: '/home/user/.env',
+  historyFilePath: '/home/user/.bash_history',
+});
+
+// Execute custom binary
+await repl.processManager.spawn('greet', []);
+
+// Manage history
+await repl.history.append('greet');
+```
+
+For more details, see [`EXTREG_FEATURES.md`](./EXTREG_FEATURES.md).
 
 ## Architecture
 

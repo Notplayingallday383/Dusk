@@ -608,10 +608,11 @@ export class ProcessManager {
   async createPidZero(
     baseFuncs: FuncTable,
     write: (text: string) => void,
-    opts?: { user?: string; hostname?: string },
+    opts?: { user?: string; hostname?: string; additionalEnv?: Record<string, string> },
   ): Promise<EngineInstance> {
     const user = opts?.user ?? 'user';
     const hostname = opts?.hostname ?? 'duskjs';
+    const additionalEnv = opts?.additionalEnv ?? {};
     const dispatchHolder: DispatchHolder = { dispatch: null };
     const spawnFuncs = this.buildSpawnFuncs(dispatchHolder);
     const consoleFuncs: FuncTable = {
@@ -681,6 +682,7 @@ export class ProcessManager {
       ['HOSTNAME', hostname],
       ['SHELL', '/bin/sh'],
       ['TERM', 'dumb'],
+      ...Object.entries(additionalEnv),
     ]);
     const zeroHandle: DuskProcessHandle = {
       pid: 0,
