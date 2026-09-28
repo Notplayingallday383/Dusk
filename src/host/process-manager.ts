@@ -1,13 +1,19 @@
-import { createEngine, type EngineInstance, type FuncTable, type SendFn } from './engine-instance';
-import type { FSBackend } from './fs-backend';
+import { createNativeEngine, type EngineFactory, type EngineInstance, type FuncTable, type SendFn } from './engine-instance';
+import type { FSBackend, FSMutation } from './fs-backend';
 import { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } from './fs-backend';
 import { createFDTable, type FDTable } from './fd-table';
 import { norm, dirname } from './vfs';
+import { transformStaticImports } from './esm-static-transform';
+import { resolveModule as resolveSharedModule } from './module-resolver';
+import { createNativePackageRegistry, type NativePackageRegistry, type NativePackageReplacementEntries, type NativePackageReplacementEntry } from './native-package-registry';
+import { esbuildWasmReplacementSource } from './esbuild-wasm';
+import { rollupBrowserReplacementSource, rollupParseAstReplacementSource } from './rollup-browser';
 import { SERIAL_RES_SIZE } from '../protocol/messages';
 import dshBinarySource from '../binaries/dsh/binary-entry.ts?worldsrc';
-// /bin/node, /bin/sh.legacy, /bin/sqlite3, /bin/python3, and the dpm bundle
+import { loadDpmWasmCommand, type DpmHostCapabilities, type DpmHttpResponse, type DpmWasmCommand } from './dpm-wasm';
+  // /bin/node, /bin/sh.legacy, /bin/python3, and the dpm bundle
 // family are only needed when the user (or a script) explicitly invokes them.
-// dsh has its own in-engine `js-exec` and `node` REPL, and dsh's sqlite3/python3
+  // dsh has its own in-engine `js-exec` and `node` REPL, and dsh's python3
 // custom commands go through host IPC — none of that touches these bundles.
 // We load them lazily on first spawn to keep idle bundle+parsed-JS footprint
 // small. See the registerLazyBinary calls in the constructor.
@@ -15,6 +21,8 @@ import { BUILTIN_BINARIES, JSH_COMMAND_SET } from './builtin-binaries';
 import { createSocketRegistry, type SocketRegistry, type SocketPair } from './socket-registry';
 import { createStreamRegistry, type StreamRegistry } from './stream-registry';
 import { createPtyManager, type PtyManager, type Pty } from './pty';
+import { createRelayTlsServer, type RelayListenAuthorizer, type TlsServerConnection } from './relay-tls-server';
+import type { TcpProvider, TcpStream } from './tcp';
 
 const SIGNAL_NUMBERS: Record<string, number> = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: 7, SIGFPE: 8,
@@ -55,6 +63,37 @@ export interface SpawnSyncResult {
   status: number;
 }
 
+export interface HostBinaryContext {
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  stdin?: Uint8Array;
+}
+
+export interface HostBinaryResult {
+  status?: number;
+  stdout?: string | Uint8Array;
+  stderr?: string | Uint8Array;
+}
+
+export type HostBinary = (context: HostBinaryContext) => HostBinaryResult | Promise<HostBinaryResult>;
+
+export interface StreamingHostBinaryContext {
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  stdin: ReadableStream<Uint8Array>;
+  stdout(chunk: Uint8Array): Promise<void>;
+  stderr(chunk: Uint8Array): Promise<void>;
+}
+
+export interface StreamingHostProcess {
+  exit: Promise<number>;
+  kill(): void;
+}
+
+export type StreamingHostBinary = (context: StreamingHostBinaryContext) => StreamingHostProcess | Promise<StreamingHostProcess>;
+
 export interface RelaySocket {
   onData(cb: (data: Uint8Array) => void): () => void;
   onClose(cb: (reason: number) => void): () => void;
@@ -64,11 +103,71 @@ export interface RelaySocket {
 
 export interface RelayListener {
   registerListener(host: string, port: number, handler: (socket: RelaySocket) => void): () => void;
+  authorizeListen?: RelayListenAuthorizer;
+}
+
+/** The narrow MoonBeam surface available to approved host integrations. */
+export interface MoonbeamAttachableRelay {
+  attach(metadata?: MoonbeamAttachmentMetadata): MessagePort;
+}
+
+export interface MoonbeamAttachmentMetadata {
+  label?: string;
+}
+
+export interface DuskRelayCapability {
+  attach(metadata?: MoonbeamAttachmentMetadata): MessagePort;
+}
+
+export type SshHostKeyVerification =
+  | { knownHosts: readonly string[] }
+  | { hostKeyFingerprint: string }
+  | { hostKey: string }
+  | { insecureSkipHostKeyVerification: true }
+  | { trustOnFirstUse: true };
+
+export interface SshWasmSource {
+  wasmPath: string;
+  wasmExecPath: string;
+}
+
+export interface SshAdapterContext {
+  relay: DuskRelayCapability;
+  readFile(path: string, cwd: string): Promise<string>;
+  hostKeyVerification: SshHostKeyVerification;
+  wasm: SshWasmSource;
+  registerSsh(binary: StreamingHostBinary): void;
+}
+
+export interface SshAdapter {
+  register(context: SshAdapterContext): void;
+}
+
+export interface SshOptions {
+  adapter: SshAdapter;
+  hostKeyVerification: SshHostKeyVerification;
+  wasm: SshWasmSource;
 }
 
 export interface ProcessManagerOptions {
   relay?: RelayListener;
+  relayTls?: {
+    Connection: new (certificateChain: string | Uint8Array, privateKey: string | Uint8Array, options?: unknown) => TlsServerConnection;
+    authorize: RelayListenAuthorizer;
+  };
+  cleanupNetworkForPid?: (pid: number) => void;
+  /** Generic outbound TCP transport available to guest node:net clients. */
+  tcpProvider?: TcpProvider;
+  engineFactory?: EngineFactory;
+  dpmWasm?: DpmWasmCommand;
+  dpmFetch?: (url: string) => Promise<DpmHttpResponse>;
+  dpmFetchBytes?: (url: string) => Promise<Uint8Array>;
+  nativePackageReplacements?: NativePackageReplacementEntries;
+  /** Enables a host-supplied SSH bridge over the configured MoonBeam relay. */
+  ssh?: SshOptions;
 }
+
+export type { DpmWasmCommand } from './dpm-wasm';
 
 interface RelaySocketRecord {
   socket: RelaySocket;
@@ -84,12 +183,22 @@ interface RelayServerRecord {
   socketIds: Set<number>;
 }
 
+interface ExternalTcpSocketRecord {
+  pid: number;
+  stream?: TcpStream;
+  closed: boolean;
+  connected: boolean;
+  pendingWrites: Uint8Array[];
+  shutdownRequested: boolean;
+  pendingEvents: Array<{ kind: 'data' | 'end' | 'error'; payload?: unknown }>;
+}
+
 interface ProcessRecord {
   pid: number;
   ppid: number;
   pgid: number;
   sid: number;
-  engine: EngineInstance;
+  engine?: EngineInstance;
   handle: DuskProcessHandle;
   stdinBuffer: Uint8Array[];
   stdinClosed: boolean;
@@ -100,6 +209,7 @@ interface ProcessRecord {
   cwd: string;
   title: string;
   startTime: number;
+  signalListeners: Set<string>;
   exitSignal?: string;
 }
 
@@ -107,6 +217,11 @@ interface ProcessRecord {
 
 interface DispatchHolder {
   dispatch: ((js: string) => void) | null;
+}
+
+interface InternalSpawnOptions extends SpawnOptions {
+  _parentPid?: number;
+  _onChildExit?: (emit: () => void) => void;
 }
 
 const formatErr = (e: unknown): string => (e instanceof Error ? (e.stack ?? e.message) : String(e));
@@ -123,216 +238,25 @@ const normalizeStdin = (stdin: unknown): Uint8Array | undefined => {
   return undefined;
 };
 
-// Node-compatible package.json `exports` field resolution.
-//
-// Spec reference: https://nodejs.org/api/packages.html#package-entry-points
-// Subset implemented:
-//   - String shorthand: "exports": "./index.js"
-//   - Conditional map (no subpath): { "import": "...", "require": "...", "default": "..." }
-//   - Subpath map: { "./feature": "./feature.js", ".": "./main.js" }
-//   - Subpath patterns: { "./internal/*": "./src/internal/*.js" }
-//   - Nested conditional: { "./a": { "node": "./a.node.js", "default": "./a.js" } }
-//   - Falsy targets (null) → access denied
-//
-// Default conditions matched: ["node", "default", "require"]  (CJS path)
-// For ESM the resolver here is shared; the engine-side esm.ts uses a similar
-// algorithm internally. The CJS-only set is the safer default.
-
-const DEFAULT_CONDITIONS = ['node', 'default', 'require'];
-
-type ExportsValue =
-  | string
-  | null
-  | ExportsValue[]
-  | { [key: string]: ExportsValue };
-
-const matchPatternSubpath = (pattern: string, subpath: string): string | null => {
-  // pattern: "./feature/*" or "./feature/*.js" — the * matches one or more chars.
-  const starIdx = pattern.indexOf('*');
-  if (starIdx === -1) return pattern === subpath ? '' : null;
-  const prefix = pattern.slice(0, starIdx);
-  const suffix = pattern.slice(starIdx + 1);
-  if (!subpath.startsWith(prefix)) return null;
-  if (!subpath.endsWith(suffix)) return null;
-  if (subpath.length < prefix.length + suffix.length) return null;
-  return subpath.slice(prefix.length, subpath.length - suffix.length);
-};
-
-const applyPatternTarget = (target: string, capture: string): string => {
-  return target.split('*').join(capture);
-};
-
-const resolveExportsValue = (
-  value: ExportsValue,
-  conditions: Set<string>,
-): string | null => {
-  if (value === null) return null;
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) {
-    for (const v of value) {
-      const r = resolveExportsValue(v, conditions);
-      if (r !== null) return r;
-    }
-    return null;
-  }
-  if (typeof value === 'object') {
-    for (const key of Object.keys(value)) {
-      if (conditions.has(key) || key === 'default') {
-        const r = resolveExportsValue(value[key]!, conditions);
-        if (r !== null) return r;
-      }
-    }
-    return null;
-  }
-  return null;
-};
-
-const resolveExports = (
-  pkgJson: { name?: string; exports?: ExportsValue },
-  subpath: string,
-  conditions: Set<string>,
-): string | null => {
-  const exp = pkgJson.exports;
-  if (exp === undefined) return null;
-
-  // Sugar form: "exports": "./index.js" → equivalent to { ".": "./index.js" }
-  if (typeof exp === 'string' || Array.isArray(exp)) {
-    if (subpath === '.') return resolveExportsValue(exp, conditions);
-    return null;
-  }
-
-  if (exp === null) return null;
-
-  if (typeof exp !== 'object') return null;
-
-  // Determine whether this is a subpath map or a conditional map.
-  // Subpath map: all keys start with '.'
-  const keys = Object.keys(exp);
-  const isSubpathMap = keys.length > 0 && keys.every((k) => k.startsWith('.'));
-
-  if (!isSubpathMap) {
-    // It's a conditional map at root; only "." subpath allowed.
-    if (subpath !== '.') return null;
-    return resolveExportsValue(exp, conditions);
-  }
-
-  // Exact match first
-  if (exp[subpath] !== undefined) {
-    return resolveExportsValue(exp[subpath]!, conditions);
-  }
-
-  // Pattern match — longest matching prefix wins
-  let bestPattern: string | null = null;
-  let bestCapture: string | null = null;
-  for (const key of keys) {
-    if (!key.includes('*')) continue;
-    const capture = matchPatternSubpath(key, subpath);
-    if (capture === null) continue;
-    if (bestPattern === null || key.length > bestPattern.length) {
-      bestPattern = key;
-      bestCapture = capture;
-    }
-  }
-  if (bestPattern !== null && bestCapture !== null) {
-    const target = resolveExportsValue(exp[bestPattern]!, conditions);
-    if (target === null) return null;
-    return applyPatternTarget(target, bestCapture);
-  }
-
-  return null;
-};
-
-const parsePackageRequest = (request: string): { pkg: string; subpath: string } => {
-  // "@scope/pkg" or "@scope/pkg/sub/path"
-  if (request.startsWith('@')) {
-    const firstSlash = request.indexOf('/');
-    if (firstSlash === -1) return { pkg: request, subpath: '.' };
-    const secondSlash = request.indexOf('/', firstSlash + 1);
-    if (secondSlash === -1) return { pkg: request, subpath: '.' };
-    return {
-      pkg: request.slice(0, secondSlash),
-      subpath: '.' + request.slice(secondSlash),
-    };
-  }
-  const slash = request.indexOf('/');
-  if (slash === -1) return { pkg: request, subpath: '.' };
-  return {
-    pkg: request.slice(0, slash),
-    subpath: '.' + request.slice(slash),
-  };
-};
-
-const resolveModule = async (fs: FSBackend, request: string, fromDir: string): Promise<string> => {
-  const tryFile = async (p: string): Promise<string | null> => {
-    const n = norm(p);
-    if ((await fs.exists(n)) && (await fs.stat(n)).isFile) return n;
-    for (const ext of ['.js', '.json', '.cjs', '.mjs']) if (await fs.exists(n + ext)) return n + ext;
-    if ((await fs.exists(n)) && (await fs.stat(n)).isDirectory) {
-      if (await fs.exists(n + '/package.json')) {
-        const main = (JSON.parse(await fs.readFile(n + '/package.json')) as { main?: string }).main;
-        if (main) { const m = await tryFile(n + '/' + main); if (m) return m; }
-      }
-      const idx = await tryFile(n + '/index');
-      if (idx) return idx;
-    }
-    return null;
-  };
-
-  if (request.startsWith('./') || request.startsWith('../') || request.startsWith('/')) {
-    const m = await tryFile(request.startsWith('/') ? request : fromDir + '/' + request);
-    if (m) return m;
-    throw new Error('Cannot find module ' + request);
-  }
-
-  // Bare specifier — walk up node_modules, considering exports field
-  const { pkg, subpath } = parsePackageRequest(request);
-  const conditions = new Set(DEFAULT_CONDITIONS);
-
-  let dir = fromDir;
-  while (true) {
-    const pkgDir = dir + '/node_modules/' + pkg;
-    if (await fs.exists(pkgDir + '/package.json')) {
-      const pkgJson = JSON.parse(await fs.readFile(pkgDir + '/package.json')) as {
-        name?: string; main?: string; exports?: ExportsValue;
-      };
-
-      // Try exports field first if present
-      if (pkgJson.exports !== undefined) {
-        const target = resolveExports(pkgJson, subpath, conditions);
-        if (target !== null) {
-          // target is relative like "./dist/index.js"; resolve against pkgDir
-          const resolved = pkgDir + '/' + target.replace(/^\.\//, '');
-          if (await fs.exists(resolved)) return norm(resolved);
-          // Try with extensions in case the target doesn't include one
-          const withExt = await tryFile(resolved);
-          if (withExt) return withExt;
-          throw new Error(`Module ${request}: exports target '${target}' does not exist`);
-        }
-        // exports field exists but didn't match → strict mode: deny
-        throw new Error(`Module ${request}: subpath '${subpath}' is not defined by "exports" in ${pkg}/package.json`);
-      }
-
-      // No exports — fall back to legacy resolution
-      const subRelative = subpath === '.' ? '' : subpath.replace(/^\.\//, '/');
-      const m = await tryFile(pkgDir + subRelative);
-      if (m) return m;
-    }
-    if (dir === '/' || dir === '') break;
-    dir = dirname(dir);
-  }
-  throw new Error('Cannot find module ' + request);
-};
-
 export class ProcessManager {
   private fs: FSBackend;
   private netFuncs: FuncTable;
   private binaries = new Map<string, string>();
+  private hostBinaries = new Map<string, HostBinary>();
+  private streamingHostBinaries = new Map<string, StreamingHostBinary>();
+  private aliases = new Map<string, { target: string; args: string[] }>();
   private processes = new Map<number, ProcessRecord>();
   private nextPid = 1;
   private socketRegistry: SocketRegistry = createSocketRegistry();
   private relay: RelayListener | undefined;
+  private relayGeneration = 0;
+  private closed = false;
+  private relayTls: ProcessManagerOptions['relayTls'];
+  private networkCleanup: ((pid: number) => void) | undefined;
   private relayServers = new Map<number, RelayServerRecord>();
   private relaySockets = new Map<number, RelaySocketRecord>();
+  private externalTcpSockets = new Map<number, ExternalTcpSocketRecord>();
+  private readonly tcpProvider: TcpProvider | undefined;
   private streamRegistryImpl: StreamRegistry = createStreamRegistry();
 
   public get streamRegistry(): StreamRegistry {
@@ -341,6 +265,47 @@ export class ProcessManager {
   private ptyManager: PtyManager = createPtyManager();
   private dispatchByPid = new Map<number, (js: string) => void>();
   private fdTables = new Map<number, FDTable>();
+  private fsWatchSubscriptions = new Map<number, Map<number, () => void>>();
+  private nextFSWatchSubscription = 1;
+  private pendingFSWatchMutations = new Map<number, Map<number, Map<string, FSMutation>>>();
+  private fsWatchDispatchScheduled = new Set<number>();
+
+  private clearFSWatchSubscriptions(pid: number): void {
+    const subscriptions = this.fsWatchSubscriptions.get(pid);
+    if (!subscriptions) return;
+    for (const unsubscribe of subscriptions.values()) unsubscribe();
+    this.fsWatchSubscriptions.delete(pid);
+    this.pendingFSWatchMutations.delete(pid);
+    this.fsWatchDispatchScheduled.delete(pid);
+  }
+
+  private queueFSWatchMutation(pid: number, id: number, event: FSMutation): void {
+    let bySubscription = this.pendingFSWatchMutations.get(pid);
+    if (!bySubscription) {
+      bySubscription = new Map();
+      this.pendingFSWatchMutations.set(pid, bySubscription);
+    }
+    let events = bySubscription.get(id);
+    if (!events) {
+      events = new Map();
+      bySubscription.set(id, events);
+    }
+    events.set(`${event.type}\0${event.path}\0${event.previousPath ?? ''}`, event);
+    if (this.fsWatchDispatchScheduled.has(pid)) return;
+    this.fsWatchDispatchScheduled.add(pid);
+    setTimeout(() => {
+      this.fsWatchDispatchScheduled.delete(pid);
+      const pending = this.pendingFSWatchMutations.get(pid);
+      this.pendingFSWatchMutations.delete(pid);
+      const dispatch = this.dispatchByPid.get(pid);
+      if (!pending || !dispatch) return;
+      for (const [subscriptionId, mutations] of pending) {
+        for (const mutation of mutations.values()) {
+          dispatch(`globalThis.__fsWatch?.dispatch(${subscriptionId}, ${JSON.stringify(mutation)});`);
+        }
+      }
+    }, 0);
+  }
 
   private getOrCreateFDTable(pid: number): FDTable {
     let t = this.fdTables.get(pid);
@@ -350,10 +315,16 @@ export class ProcessManager {
 
   // Optional binaries loaded on first spawn. Keeps ~500KB+ of parsed JS
   // off the idle heap when the demo/user never invokes these directly.
-  // Note: dsh's built-in `sqlite3` and `python3` commands go through host
-  // IPC and DO NOT need /bin/sqlite3 or /bin/python3 — those bundles are
-  // only needed if the user explicitly invokes /bin/{sqlite3,python3}.
+  // Note: dsh's built-in python3 command goes through host IPC and does not
+  // need /bin/python3. Optional extensions register their own binaries.
   private lazyLoaders: Map<string, () => Promise<string>> = new Map();
+  private readonly engineFactory: EngineFactory;
+  private readonly dpmWasm: DpmWasmCommand | undefined;
+  private readonly dpmFetch: ((url: string) => Promise<DpmHttpResponse>) | undefined;
+  private readonly dpmFetchBytes: ((url: string) => Promise<Uint8Array>) | undefined;
+  private dpmTransactions = new Map<string, Promise<void>>();
+  private nextDpmTransactionId = 0;
+  private readonly nativePackageRegistry: NativePackageRegistry;
 
   constructor(
     fs: FSBackend,
@@ -364,12 +335,33 @@ export class ProcessManager {
     this.fs = fs;
     this.netFuncs = { ...netFuncs, ...extraFuncs };
     this.relay = options.relay;
+    this.relayTls = options.relayTls;
+    this.networkCleanup = options.cleanupNetworkForPid;
+    this.tcpProvider = options.tcpProvider;
+    this.engineFactory = options.engineFactory ?? createNativeEngine;
+    this.dpmWasm = options.dpmWasm;
+    this.dpmFetch = options.dpmFetch;
+    this.dpmFetchBytes = options.dpmFetchBytes;
+    const defaultNativePackageReplacements: readonly NativePackageReplacementEntry[] = [
+      ['esbuild', esbuildWasmReplacementSource],
+      ['rollup', rollupBrowserReplacementSource, { packageVersion: '4.20.0', packagePathSuffix: '/node_modules/vite/node_modules/rollup', packageEntryPath: 'dist/rollup.js' }],
+      ['rollup/parseAst', rollupParseAstReplacementSource, { packageVersion: '4.20.0', packagePathSuffix: '/node_modules/vite/node_modules/rollup' }],
+    ];
+    const callerEntries: readonly NativePackageReplacementEntry[] = !options.nativePackageReplacements
+      ? []
+      : Array.isArray(options.nativePackageReplacements)
+        ? options.nativePackageReplacements
+        : Object.entries(options.nativePackageReplacements).map(([specifier, source]) => [specifier, source]);
+    const replacementEntries = new Map<string, NativePackageReplacementEntry>();
+    for (const entry of defaultNativePackageReplacements) replacementEntries.set(entry[0], entry);
+    for (const entry of callerEntries) replacementEntries.set(entry[0], entry);
+    this.nativePackageRegistry = createNativePackageRegistry([...replacementEntries.values()]);
     // /bin/dsh (Dusk SHell) is the canonical shell. /bin/sh and /bin/jsh
     // are aliases so scripts using shebang `#!/bin/sh` and existing
     // demos/tests that reference /bin/jsh keep working.
     //
     // Only dsh itself is registered eagerly — that's the one binary the demo
-    // spawns on boot. Everything else (node, legacy shell, sqlite3, python3,
+    // spawns on boot. Everything else (node, legacy shell, python3,
     // dpm family) is loaded on demand from a code-split chunk on first spawn.
     // Idle bundles stay small; the first invocation pays a one-time fetch.
     this.registerBinary('/bin/dsh', dshBinarySource);
@@ -385,26 +377,80 @@ export class ProcessManager {
     // someone actually calls it. Remove entirely once dsh proves stable.
     this.registerLazyBinary('/bin/sh.legacy', async () =>
       (await import('../shell/binary-entry.ts?worldsrc')).default);
-    // Lazy: sqlite3, python3, python alias, dpm/dpx/npm/npx/pnpm.
+    // Lazy: python3, python alias, dpm/dpx/npm/npx/pnpm.
     // These get their source fetched from a code-split chunk on first spawn.
-    this.registerLazyBinary('/bin/sqlite3', async () =>
-      (await import('../binaries/sqlite3/binary-entry.ts?worldsrc')).default);
     const loadPython = async (): Promise<string> =>
       (await import('../binaries/python3/binary-entry.ts?worldsrc')).default;
     this.registerLazyBinary('/bin/python3', loadPython);
     this.registerLazyBinary('/bin/python', loadPython);
-    this.registerLazyBinary('/bin/dpm', async () =>
-      (await import('./dpm-bundles/dpm-bundle.js?raw')).default);
-    this.registerLazyBinary('/bin/dpx', async () =>
-      (await import('./dpm-bundles/dpx-bundle.js?raw')).default);
-    this.registerLazyBinary('/bin/npm', async () =>
-      (await import('./dpm-bundles/npm-bundle.js?raw')).default);
-    this.registerLazyBinary('/bin/npx', async () =>
-      (await import('./dpm-bundles/npx-bundle.js?raw')).default);
-    this.registerLazyBinary('/bin/pnpm', async () =>
-      (await import('./dpm-bundles/pnpm-bundle.js?raw')).default);
+    const runDpm = async ({ args, cwd, env, stdin }: HostBinaryContext) => {
+      const result = await this.withDpmProjectLock(cwd, async () => {
+      const transactionId = this.nextDpmTransactionId++;
+      const command = this.dpmWasm ?? await loadDpmWasmCommand();
+      const capabilities: DpmHostCapabilities = {
+        read: (path) => this.fs.readFile(path),
+        atomicWrite: async (path, content) => {
+          const temporary = `${path}.dpm-tmp-${transactionId}`;
+          await this.fs.writeFile(temporary, content);
+          await this.fs.rename(temporary, path);
+        },
+        remove: (path) => this.fs.rm(path),
+        exists: (path) => this.fs.exists(path),
+        mkdir: (path) => this.fs.mkdir(path, { recursive: true }),
+        fetch: (url) => this.dpmFetch ? this.dpmFetch(url) : Promise.reject(new Error('network capability is unavailable')),
+        fetchBytes: (url) => this.dpmFetchBytes ? this.dpmFetchBytes(url) : Promise.reject(new Error('binary network capability is unavailable')),
+        readBytes: (path) => this.fs.readFileBytes(path),
+        readDir: (path) => this.fs.readdir(path),
+        stat: async (path) => {
+          const lstat = this.fs.lstat ? await this.fs.lstat(path) : undefined;
+          if (lstat?.isSymlink) return 'symlink';
+          const stat = lstat ?? await this.fs.stat(path);
+          return stat.isDirectory ? 'directory' : 'file';
+        },
+        atomicWriteBytes: async (path, content) => {
+          const temporary = `${path}.dpm-tmp-${transactionId}`;
+          await this.fs.writeFileBytes(temporary, content);
+          await this.fs.rename(temporary, path);
+        },
+        stdout: async () => {},
+        stderr: async () => {},
+      };
+        return command.execute(args, capabilities, cwd, { env, ...(stdin ? { stdin: Array.from(stdin) } : {}) });
+      });
+      if (!result.plan) return result;
+      const execution = await this.spawnSync(result.plan.command, result.plan.args, {
+        cwd,
+        env: result.plan.env,
+        ...(result.plan.stdin ? { stdin: result.plan.stdin } : {}),
+      });
+      return execution;
+    };
+    this.registerHostBinary('/bin/dpm', runDpm);
+    this.registerHostBinary('/bin/npm', (context) => runDpm({ ...context, args: ['npm', ...context.args] }));
+    this.registerHostBinary('/bin/pnpm', (context) => runDpm({
+      ...context,
+      args: ['npm', ...(context.args[0] === 'add' ? ['install', ...context.args.slice(1)] : context.args[0] === 'dlx' ? ['exec', ...context.args.slice(1)] : context.args)],
+    }));
+    this.registerHostBinary('/bin/npx', (context) => runDpm({ ...context, args: ['npm', 'exec', ...context.args] }));
+    this.registerHostBinary('/bin/dpx', (context) => runDpm({ ...context, args: ['npm', 'exec', ...context.args] }));
     for (const [name, src] of Object.entries(BUILTIN_BINARIES)) {
       this.registerBinary(name, src);
+    }
+  }
+
+  private async withDpmProjectLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+    const project = norm(cwd);
+    const previous = this.dpmTransactions.get(project) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => next);
+    this.dpmTransactions.set(project, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.dpmTransactions.get(project) === tail) this.dpmTransactions.delete(project);
     }
   }
 
@@ -419,6 +465,16 @@ export class ProcessManager {
     if (closeTransport) record.socket.close(reason);
   }
 
+  private closeExternalTcpSocket(socketId: number, closeTransport: boolean): void {
+    const record = this.externalTcpSockets.get(socketId);
+    if (!record || record.closed) return;
+    record.closed = true;
+    this.externalTcpSockets.delete(socketId);
+    if (closeTransport) {
+      try { record.stream?.close(); } catch { /* best-effort shutdown */ }
+    }
+  }
+
   private unregisterRelayServer(serverId: number): void {
     const record = this.relayServers.get(serverId);
     if (!record) return;
@@ -427,7 +483,15 @@ export class ProcessManager {
     for (const socketId of [...record.socketIds]) this.closeRelaySocket(socketId, true);
   }
 
+  private releaseRelayServers(): void {
+    for (const [serverId] of [...this.relayServers]) {
+      this.unregisterRelayServer(serverId);
+      this.socketRegistry.unregisterServer(serverId);
+    }
+  }
+
   private cleanupNetworkForPid(pid: number): void {
+    try { this.networkCleanup?.(pid); } catch { /* best-effort shutdown */ }
     for (const [serverId, record] of [...this.relayServers]) {
       if (record.pid === pid) {
         this.unregisterRelayServer(serverId);
@@ -437,11 +501,64 @@ export class ProcessManager {
     for (const [socketId, record] of [...this.relaySockets]) {
       if (record.pid === pid) this.closeRelaySocket(socketId, true);
     }
+    for (const [socketId, record] of [...this.externalTcpSockets]) {
+      if (record.pid === pid) this.closeExternalTcpSocket(socketId, true);
+    }
+  }
+
+  /**
+   * Returns an attach-only view of the current MoonBeam relay. The view is
+   * invalidated when the relay changes or this manager closes.
+   */
+  relayCapability(): DuskRelayCapability {
+    const relay = this.relay as (RelayListener & Partial<MoonbeamAttachableRelay>) | undefined;
+    const generation = this.relayGeneration;
+    return {
+      attach: (metadata = {}): MessagePort => {
+        if (this.closed || this.relayGeneration !== generation || this.relay !== relay) {
+          throw new Error('Dusk relay capability is no longer active');
+        }
+        if (typeof relay?.attach !== 'function') {
+          throw new Error('Dusk relay does not support attach()');
+        }
+        return relay.attach(metadata);
+      },
+    };
+  }
+
+  /** Replaces the host-owned relay and invalidates previously issued capabilities. */
+  setRelay(relay: RelayListener | undefined): void {
+    if (this.closed) throw new Error('ProcessManager is closed');
+    if (this.relay === relay) return;
+    this.releaseRelayServers();
+    this.relay = relay;
+    this.relayGeneration++;
+  }
+
+  /** Invalidates host relay capabilities when the manager is torn down. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.relayGeneration++;
+    this.releaseRelayServers();
+    for (const socketId of [...this.externalTcpSockets.keys()]) this.closeExternalTcpSocket(socketId, true);
   }
 
   registerBinary(name: string, jsSource: string): void {
     this.binaries.set(name, jsSource);
     this.lazyLoaders.delete(name);
+  }
+
+  registerHostBinary(name: string, binary: HostBinary): void {
+    this.hostBinaries.set(name, binary);
+  }
+
+  registerStreamingHostBinary(name: string, binary: StreamingHostBinary): void {
+    this.streamingHostBinaries.set(name, binary);
+  }
+
+  registerAlias(name: string, target: string, args: string[] = []): void {
+    this.aliases.set(name, { target, args: [...args] });
   }
 
   // Register a binary whose source is fetched on first spawn. Idempotent —
@@ -469,6 +586,11 @@ export class ProcessManager {
     return { cmd: '/bin/dsh', args: ['-c', script] };
   }
 
+  private resolveAlias(cmd: string, args: string[]): { cmd: string; args: string[] } {
+    const alias = this.aliases.get(cmd);
+    return alias ? { cmd: alias.target, args: [...alias.args, ...args] } : { cmd, args };
+  }
+
   // Resolve a binary name to its source, forcing a lazy load if needed.
   // Returns undefined if the binary isn't registered at all (caller falls
   // back to reading a script from TFS).
@@ -487,6 +609,10 @@ export class ProcessManager {
     return this.processes.get(pid)?.handle;
   }
 
+  dispatch(pid: number, js: string): void {
+    this.dispatchByPid.get(pid)?.(js);
+  }
+
   activePids(): number[] {
     return [...this.processes.keys()];
   }
@@ -495,12 +621,12 @@ export class ProcessManager {
     // Include both eagerly-loaded and lazily-registered names so consumers
     // (which command completion, PATH search) see the full set even before
     // the lazy sources have been fetched.
-    const names = new Set<string>([...this.binaries.keys(), ...this.lazyLoaders.keys()]);
+    const names = new Set<string>([...this.binaries.keys(), ...this.lazyLoaders.keys(), ...this.hostBinaries.keys(), ...this.streamingHostBinaries.keys(), ...this.aliases.keys()]);
     return [...names].sort();
   }
 
   hasBinary(name: string): boolean {
-    return this.binaries.has(name) || this.lazyLoaders.has(name);
+    return this.binaries.has(name) || this.lazyLoaders.has(name) || this.hostBinaries.has(name) || this.streamingHostBinaries.has(name) || this.aliases.has(name);
   }
 
   getBinarySource(name: string): string | undefined {
@@ -600,9 +726,10 @@ export class ProcessManager {
   }
 
   private _emitChildExit(rec: ProcessRecord, code: number): void {
-    // SIGCHLD to parent
+    // SIGCHLD is ignored by default, so do not create a secondary eval for
+    // parents that have not subscribed to it.
     const parent = this.processes.get(rec.ppid);
-    if (parent) this._deliverSignalToOne(parent, 'SIGCHLD');
+    if (parent?.signalListeners.has('SIGCHLD')) this._deliverSignalToOne(parent, 'SIGCHLD');
   }
 
   async createPidZero(
@@ -661,10 +788,11 @@ export class ProcessManager {
       },
     };
     const funcs: FuncTable = { ...baseFuncs, ...this.buildFuncs(0), ...consoleFuncs, ...writeFunc, ...spawnFuncs };
-    const engine = await createEngine(0, funcs);
+    const engine = await this.engineFactory(0, funcs);
     const terminate = engine.terminate.bind(engine);
     engine.terminate = async (): Promise<number> => {
       this.cleanupNetworkForPid(0);
+      this.clearFSWatchSubscriptions(0);
       return terminate();
     };
     dispatchHolder.dispatch = engine.dispatch;
@@ -694,7 +822,7 @@ export class ProcessManager {
       pid: 0, ppid: 0, pgid: 0, sid: 0, engine, handle: zeroHandle,
       stdinBuffer: [], stdinClosed: true,
       argv: ['node'], argv0: 'node', execPath: '/bin/node',
-      env, cwd: home, title: hostname, startTime: Date.now(),
+      env, cwd: home, title: hostname, startTime: Date.now(), signalListeners: new Set(),
     };
     this.processes.set(0, zeroRec);
 
@@ -702,6 +830,7 @@ export class ProcessManager {
   }
 
   async spawn(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<DuskProcessHandle> {
+    ({ cmd, args } = this.resolveAlias(cmd, args));
     // Fold JSH-wrapper spawns into a direct dsh -c invocation before we
     // allocate a pid or a worker. See maybeElideJshWrapper for rationale.
     ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
@@ -711,6 +840,21 @@ export class ProcessManager {
     let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let stdoutClosed = false;
     const stdoutBacklog: Uint8Array[] = [];
+    const stdoutHostWrites: { chunk: Uint8Array; resolve: () => void }[] = [];
+    const drainStdoutHostWrites = (): void => {
+      while (stdoutController && stdoutHostWrites.length > 0 && (stdoutController.desiredSize ?? 0) > 0) {
+        const write = stdoutHostWrites.shift()!;
+        stdoutController.enqueue(write.chunk);
+        write.resolve();
+      }
+    };
+    const flushStdoutHostWrites = (): void => {
+      while (stdoutController && stdoutHostWrites.length > 0) {
+        const write = stdoutHostWrites.shift()!;
+        try { stdoutController.enqueue(write.chunk); } catch { /* closed */ }
+        write.resolve();
+      }
+    };
     const stdout = new ReadableStream<Uint8Array>({
       start(c) {
         stdoutController = c;
@@ -718,6 +862,7 @@ export class ProcessManager {
         stdoutBacklog.length = 0;
         if (stdoutClosed) { try { c.close(); } catch { /* */ } }
       },
+      pull() { drainStdoutHostWrites(); },
     });
     const enqueueStdout = (chunk: Uint8Array): void => {
       if (stdoutController) { try { stdoutController.enqueue(chunk); } catch { /* closed */ } }
@@ -725,12 +870,33 @@ export class ProcessManager {
     };
     const closeStdout = (): void => {
       stdoutClosed = true;
+      while (stdoutHostWrites.length > 0) stdoutHostWrites.shift()!.resolve();
       if (stdoutController) { try { stdoutController.close(); } catch { /* */ } }
     };
+    const writeStdout = (chunk: Uint8Array): Promise<void> => new Promise((resolve) => {
+      if (stdoutClosed) { resolve(); return; }
+      stdoutHostWrites.push({ chunk, resolve });
+      drainStdoutHostWrites();
+    });
 
     let stderrController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let stderrClosed = false;
     const stderrBacklog: Uint8Array[] = [];
+    const stderrHostWrites: { chunk: Uint8Array; resolve: () => void }[] = [];
+    const drainStderrHostWrites = (): void => {
+      while (stderrController && stderrHostWrites.length > 0 && (stderrController.desiredSize ?? 0) > 0) {
+        const write = stderrHostWrites.shift()!;
+        stderrController.enqueue(write.chunk);
+        write.resolve();
+      }
+    };
+    const flushStderrHostWrites = (): void => {
+      while (stderrController && stderrHostWrites.length > 0) {
+        const write = stderrHostWrites.shift()!;
+        try { stderrController.enqueue(write.chunk); } catch { /* closed */ }
+        write.resolve();
+      }
+    };
     const stderr = new ReadableStream<Uint8Array>({
       start(c) {
         stderrController = c;
@@ -738,6 +904,7 @@ export class ProcessManager {
         stderrBacklog.length = 0;
         if (stderrClosed) { try { c.close(); } catch { /* */ } }
       },
+      pull() { drainStderrHostWrites(); },
     });
     const enqueueStderr = (chunk: Uint8Array): void => {
       if (stderrController) { try { stderrController.enqueue(chunk); } catch { /* closed */ } }
@@ -745,8 +912,122 @@ export class ProcessManager {
     };
     const closeStderr = (): void => {
       stderrClosed = true;
+      while (stderrHostWrites.length > 0) stderrHostWrites.shift()!.resolve();
       if (stderrController) { try { stderrController.close(); } catch { /* */ } }
     };
+    const writeStderr = (chunk: Uint8Array): Promise<void> => new Promise((resolve) => {
+      if (stderrClosed) { resolve(); return; }
+      stderrHostWrites.push({ chunk, resolve });
+      drainStderrHostWrites();
+    });
+
+    const streamingHostBinary = this.streamingHostBinaries.get(cmd);
+    if (streamingHostBinary) {
+      let stdinController!: ReadableStreamDefaultController<Uint8Array>;
+      let stdinClosed = false;
+      const stdinWrites: { chunk: Uint8Array; resolve: () => void }[] = [];
+      const drainStdinWrites = (): void => {
+        while (stdinWrites.length > 0 && (stdinController.desiredSize ?? 0) > 0) {
+          const write = stdinWrites.shift()!;
+          stdinController.enqueue(write.chunk);
+          write.resolve();
+        }
+      };
+      const stdin = new ReadableStream<Uint8Array>({
+        start(controller) { stdinController = controller; },
+        pull() { drainStdinWrites(); },
+      });
+      const closeStdin = (): void => {
+        if (stdinClosed) return;
+        stdinClosed = true;
+        while (stdinWrites.length > 0) stdinWrites.shift()!.resolve();
+        try { stdinController.close(); } catch { /* already closed */ }
+      };
+      if (stdinBytes) stdinWrites.push({ chunk: stdinBytes, resolve: () => {} });
+      drainStdinWrites();
+
+      let process: StreamingHostProcess | undefined;
+      let killed = false;
+      let settled = false;
+      let resolveExit!: (status: number) => void;
+      const exit = new Promise<number>((resolve) => { resolveExit = resolve; });
+      const pendingHostWrites = new Set<Promise<void>>();
+      const trackHostWrite = (write: Promise<void>): Promise<void> => {
+        pendingHostWrites.add(write);
+        void write.finally(() => pendingHostWrites.delete(write));
+        return write;
+      };
+      const finish = (status: number, discardOutput = false): void => {
+        if (settled) return;
+        settled = true;
+        closeStdin();
+        if (discardOutput) {
+          closeStdout();
+          closeStderr();
+        } else {
+          flushStdoutHostWrites();
+          flushStderrHostWrites();
+        }
+        void (async () => {
+          while (pendingHostWrites.size > 0) await Promise.all([...pendingHostWrites]);
+          closeStdout();
+          closeStderr();
+          this.cleanupNetworkForPid(pid);
+          this.clearFSWatchSubscriptions(pid);
+          const record = this.processes.get(pid);
+          if (record) this._emitChildExit(record, status);
+          this.processes.delete(pid);
+          resolveExit(status);
+        })();
+      };
+      const handle: DuskProcessHandle = {
+        pid,
+        exit,
+        stdin: {
+          write: async (chunk) => {
+            if (stdinClosed) return;
+            await new Promise<void>((resolve) => {
+              stdinWrites.push({ chunk, resolve });
+              drainStdinWrites();
+            });
+          },
+          close: async () => { closeStdin(); },
+        },
+        stdout,
+        stderr,
+        kill: () => {
+          if (settled) return;
+          killed = true;
+          try { process?.kill(); } catch { /* best-effort termination */ }
+          finish(137, true);
+        },
+      };
+      const env = new Map<string, string>(Object.entries(options.env ?? {}));
+      const explicitParent = (options as InternalSpawnOptions)._parentPid;
+      const parentPid = explicitParent !== undefined ? explicitParent : (this.processes.get(0)?.pid ?? 0);
+      this.processes.set(pid, {
+        pid, ppid: parentPid, pgid: pid, sid: pid, handle,
+        stdinBuffer: [], stdinClosed: false,
+        argv: [cmd, ...args], argv0: cmd, execPath: cmd,
+        env, cwd: options.cwd ?? '/', title: cmd, startTime: Date.now(), signalListeners: new Set(),
+      });
+      void Promise.resolve().then(() => streamingHostBinary({
+        args,
+        cwd: options.cwd ?? '/',
+        env: options.env ?? {},
+        stdin,
+        stdout: (chunk) => trackHostWrite(writeStdout(chunk)),
+        stderr: (chunk) => trackHostWrite(writeStderr(chunk)),
+      })).then((hostProcess) => {
+        if (settled) {
+          try { hostProcess.kill(); } catch { /* best-effort termination */ }
+          return;
+        }
+        process = hostProcess;
+        void hostProcess.exit.then(finish, () => finish(1));
+      }, () => finish(1));
+      return handle;
+    }
 
     // Stdin closure state — set up BEFORE PTY attach so PTY hooks can push
     // straight into this buffer (the same one `proc.readStdin` polls).
@@ -839,7 +1120,7 @@ export class ProcessManager {
       ...this.buildSpawnFuncs(dispatchHolder, pid),
     };
 
-    const engine = await createEngine(pid, funcs);
+    const engine = await this.engineFactory(pid, funcs);
     dispatchHolder.dispatch = engine.dispatch;
     this.dispatchByPid.set(pid, engine.dispatch);
     const entryJs = await this.buildEntry(cmd, args, options.env ?? {}, options.cwd ?? '/');
@@ -848,6 +1129,7 @@ export class ProcessManager {
       void engine.run(entryJs);
       const code = await engine.exited;
       this.cleanupNetworkForPid(pid);
+      this.clearFSWatchSubscriptions(pid);
       this.dispatchByPid.delete(pid);
       // engine.exited resolves after the worker has processed all queued messages,
       // so any proc.write from the world before process.exit has already enqueued
@@ -877,7 +1159,7 @@ export class ProcessManager {
     };
 
     const env = new Map<string, string>(Object.entries(options.env ?? {}));
-    const explicitParent = (options as SpawnOptions & { _parentPid?: number })._parentPid;
+    const explicitParent = (options as InternalSpawnOptions)._parentPid;
     const parentPid = explicitParent !== undefined ? explicitParent : (this.processes.get(0)?.pid ?? 0);
     const record: ProcessRecord = {
       pid, ppid: parentPid, pgid: pid, sid: pid, engine, handle, stdinBuffer, stdinClosed: false,
@@ -888,6 +1170,7 @@ export class ProcessManager {
       cwd: options.cwd ?? '/',
       title: cmd,
       startTime: Date.now(),
+      signalListeners: new Set(),
     };
     this.processes.set(pid, record);
     recordRef = record;
@@ -896,7 +1179,26 @@ export class ProcessManager {
   }
 
   async spawnSync(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<SpawnSyncResult> {
+    ({ cmd, args } = this.resolveAlias(cmd, args));
     ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
+    const hostBinary = this.hostBinaries.get(cmd);
+    if (hostBinary) {
+      const context: HostBinaryContext = {
+        args,
+        cwd: options.cwd ?? '/',
+        env: options.env ?? {},
+      };
+      const stdin = normalizeStdin(options.stdin);
+      if (stdin) context.stdin = stdin;
+      const result = await hostBinary(context);
+      const toBytes = (data: string | Uint8Array | undefined): Uint8Array =>
+        data instanceof Uint8Array ? data : new TextEncoder().encode(data ?? '');
+      return {
+        status: result.status ?? 0,
+        stdout: toBytes(result.stdout),
+        stderr: toBytes(result.stderr),
+      };
+    }
     const pid = this.nextPid++;
     const stdoutChunks: Uint8Array[] = [];
     const stderrChunks: Uint8Array[] = [];
@@ -943,7 +1245,7 @@ export class ProcessManager {
       ...this.buildSpawnFuncs(dispatchHolder, pid),
     };
 
-    const engine = await createEngine(pid, funcs);
+    const engine = await this.engineFactory(pid, funcs);
     dispatchHolder.dispatch = engine.dispatch;
     this.dispatchByPid.set(pid, engine.dispatch);
     const entryJs = await this.buildEntry(cmd, args, options.env ?? {}, options.cwd ?? '/');
@@ -958,18 +1260,25 @@ export class ProcessManager {
       stderr: new ReadableStream<Uint8Array>(),
       kill: () => { void engine.terminate(); },
     };
+    const requestedParentPid = (options as InternalSpawnOptions)._parentPid;
+    const parentPid = requestedParentPid !== undefined && this.processes.get(requestedParentPid)?.signalListeners.has('SIGCHLD')
+      ? requestedParentPid
+      : 0;
     const syncRec: ProcessRecord = {
-      pid, ppid: 0, pgid: pid, sid: pid, engine, handle: syncHandle, stdinBuffer: [], stdinClosed: true,
+      pid, ppid: parentPid, pgid: pid, sid: pid, engine, handle: syncHandle, stdinBuffer: [], stdinClosed: true,
       argv: [cmd, ...args], argv0: cmd, execPath: cmd,
-      env, cwd: options.cwd ?? '/', title: cmd, startTime: Date.now(),
+      env, cwd: options.cwd ?? '/', title: cmd, startTime: Date.now(), signalListeners: new Set(),
     };
     this.processes.set(pid, syncRec);
 
     void engine.run(entryJs);
     const status = await engine.exited;
     this.cleanupNetworkForPid(pid);
-    const _rec = this.processes.get(pid);
-    if (_rec) this._emitChildExit(_rec, status);
+    this.clearFSWatchSubscriptions(pid);
+    const emitChildExit = (): void => this._emitChildExit(syncRec, status);
+    const onChildExit = (options as InternalSpawnOptions)._onChildExit;
+    if (onChildExit) onChildExit(emitChildExit);
+    else emitChildExit();
     const tbl = this.fdTables.get(pid);
     if (tbl) {
       tbl.closeAll((entry) => { void this.fs.closeHandle(entry.backendHandle, { pid }).catch(() => {}); });
@@ -1091,16 +1400,43 @@ export class ProcessManager {
       'process.spawnSync': (m, send) => {
         void (async () => {
           try {
-            const opts = (m['options'] as SpawnOptions) ?? {};
-            if (callerPid !== undefined) (opts as SpawnOptions & { _parentPid?: number })._parentPid = callerPid;
+            const opts = ((m['options'] as SpawnOptions) ?? {}) as InternalSpawnOptions;
+            const notifyParent = callerPid !== undefined && this.processes.get(callerPid)?.signalListeners.has('SIGCHLD');
+            if (notifyParent) opts._parentPid = callerPid;
+            let emitChildExit: (() => void) | undefined;
+            if (notifyParent) opts._onChildExit = (emit) => { emitChildExit = emit; };
             const r = await this.spawnSync(
               m['command'] as string,
               (m['args'] as string[]) ?? [],
               opts,
             );
             send({ value: { stdout: Array.from(r.stdout), stderr: Array.from(r.stderr), status: r.status } });
+            // Let the SAB caller consume its result before a child-exit
+            // dispatch can start a secondary evaluation in that same engine.
+            if (emitChildExit) setTimeout(emitChildExit, 0);
           } catch (e) { send({ error: formatErr(e) }); }
         })();
+      },
+      'process.stdinWrite': (m, send) => {
+        const child = this.processes.get(m['pid'] as number);
+        if (!child || (callerPid !== undefined && child.ppid !== callerPid)) {
+          send({ error: 'ESRCH: no such child process' });
+          return;
+        }
+        const data = m['data'];
+        if (!Array.isArray(data)) {
+          send({ error: 'EINVAL: stdin data must be a byte array' });
+          return;
+        }
+        void child.handle.stdin.write(Uint8Array.from(data as number[])).then(() => send({ value: true }), (error) => send({ error: formatErr(error) }));
+      },
+      'process.stdinClose': (m, send) => {
+        const child = this.processes.get(m['pid'] as number);
+        if (!child || (callerPid !== undefined && child.ppid !== callerPid)) {
+          send({ error: 'ESRCH: no such child process' });
+          return;
+        }
+        void child.handle.stdin.close().then(() => send({ value: true }), (error) => send({ error: formatErr(error) }));
       },
     };
   }
@@ -1109,6 +1445,8 @@ export class ProcessManager {
     const fs = this.fs;
     const ok = (send: SendFn, value: unknown): void => send({ value });
     const err = (send: SendFn, e: unknown): void => send({ error: formatErr(e) });
+    // Process-bound IPC handlers must not let guest message data replace their owner.
+    const callerPid = (m: Record<string, unknown>): number => forPid ?? (m['pid'] as number | undefined) ?? 0;
 
     const recOf = (m: Record<string, unknown>): ProcessRecord | undefined => {
       const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
@@ -1204,6 +1542,11 @@ export class ProcessManager {
         } catch (e) {
           err(send, e);
         }
+      },
+      'process.signal.listen': (m, send) => {
+        const signal = m['signal'] as string;
+        if (signal === 'SIGCHLD') recOf(m)?.signalListeners.add(signal);
+        ok(send, true);
       },
       'process.setpgid': (m, send) => {
         const pid = (m['pid'] as number) || ((m['pid'] as number) === 0 ? ((m['callerPid'] as number) ?? forPid ?? 0) : 0);
@@ -1504,6 +1847,30 @@ export class ProcessManager {
     };
 
     const fsFuncs: FuncTable = {
+      'fs.watch.subscribe': (_m, send) => {
+        const pid = forPid ?? 0;
+        const id = this.nextFSWatchSubscription++;
+        let subscriptions = this.fsWatchSubscriptions.get(pid);
+        if (!subscriptions) {
+          subscriptions = new Map();
+          this.fsWatchSubscriptions.set(pid, subscriptions);
+        }
+        const unsubscribe = fs.subscribe((event: FSMutation) => {
+          this.queueFSWatchMutation(pid, id, event);
+        });
+        subscriptions.set(id, unsubscribe);
+        ok(send, id);
+      },
+      'fs.watch.unsubscribe': (m, send) => {
+        const pid = forPid ?? 0;
+        const id = m['id'] as number;
+        const subscriptions = this.fsWatchSubscriptions.get(pid);
+        subscriptions?.get(id)?.();
+        subscriptions?.delete(id);
+        this.pendingFSWatchMutations.get(pid)?.delete(id);
+        if (subscriptions?.size === 0) this.fsWatchSubscriptions.delete(pid);
+        ok(send, true);
+      },
       'fs.readFile': (m, send) => { void (async () => { try { ok(send, await fs.readFile(m['path'] as string)); } catch (e) { err(send, e); } })(); },
       'fs.readFileBytes': (m, send) => { void (async () => {
         try {
@@ -1619,8 +1986,8 @@ export class ProcessManager {
         } catch (e) { err(send, e); }
       })(); },
 
-      'module.resolve': (m, send) => { void (async () => { try { ok(send, await resolveModule(fs, m['request'] as string, m['fromDir'] as string)); } catch (e) { err(send, e); } })(); },
-      'module.readSource': (m, send) => { void (async () => { try { ok(send, await fs.readFile(m['path'] as string)); } catch (e) { err(send, e); } })(); },
+      'module.resolve': (m, send) => { void (async () => { try { ok(send, await resolveSharedModule(fs, m['request'] as string, m['fromDir'] as string, (m['mode'] as 'import' | 'require' | undefined) ?? 'import', new Set(), this.nativePackageRegistry)); } catch (e) { err(send, e); } })(); },
+      'module.readSource': (m, send) => { void (async () => { try { const path = m['path'] as string; const source = this.nativePackageRegistry.readSource(path) ?? await fs.readFile(path, { pid: forPid ?? 0 }); ok(send, m['mode'] === 'import' && !path.endsWith('.json') ? await transformStaticImports(source) : source); } catch (e) { err(send, e); } })(); },
     };
 
     const reg = this.socketRegistry;
@@ -1631,6 +1998,78 @@ export class ProcessManager {
     };
 
     const netFuncs: FuncTable = {
+      'net.tls.capability': (_m, send) => {
+        send({ value: !!this.relay && !!this.relayTls });
+      },
+      'net.tls.listen': (m, send) => {
+        const host = (m['host'] as string | undefined) ?? '0.0.0.0';
+        const port = (m['port'] as number) | 0;
+        const callerPid = (m['pid'] as number | undefined) ?? forPid ?? 0;
+        if (!this.relay || !this.relayTls) {
+          send({ error: 'Nova TLS server capability is not supported by the active relay host' });
+          return;
+        }
+        let serverId = -1;
+        try {
+          const registered = reg.registerServer(host, port, callerPid, (clientSocketId) => {
+            dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('connection', ${serverId}, { clientSocketId: ${clientSocketId} });`);
+          });
+          serverId = registered.id;
+          const boundHost = registered.host;
+          const boundPort = registered.port;
+          const relayRecord: RelayServerRecord = { pid: callerPid, dispose: () => {}, socketIds: new Set() };
+          relayRecord.dispose = createRelayTlsServer(this.relay, {
+            host: boundHost,
+            port: boundPort,
+            pid: callerPid,
+            certificateChain: typeof m['cert'] === 'string' ? m['cert'] : Uint8Array.from(m['cert'] as number[]),
+            privateKey: typeof m['key'] === 'string' ? m['key'] : Uint8Array.from(m['key'] as number[]),
+            Connection: this.relayTls.Connection,
+            authorize: this.relayTls.authorize,
+            onTlsClientError: (error) => {
+              dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('tlsClientError', ${serverId}, ${JSON.stringify(error.message)});`);
+            },
+            onSecureConnection: (plaintext) => {
+              const socketId = reg.allocateSocketId();
+              const record: RelaySocketRecord = {
+                socket: plaintext as unknown as RelaySocket,
+                serverId,
+                pid: callerPid,
+                offData: () => {},
+                offClose: () => {},
+              };
+              record.offData = plaintext.onData((data) => {
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(Array.from(data))});`);
+              });
+              record.offClose = plaintext.onClose(() => {
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${socketId});`);
+                this.closeRelaySocket(socketId, false);
+              });
+              this.relaySockets.set(socketId, record);
+              relayRecord.socketIds.add(socketId);
+              reg.setPair(socketId, {
+                pushToClient: (data) => plaintext.write(data),
+                closeClient: () => this.closeRelaySocket(socketId, true),
+                errorClient: () => this.closeRelaySocket(socketId, true, 1),
+              });
+              const server = reg.findServer(boundHost, boundPort);
+              if (server) server.onConnection(socketId);
+              else plaintext.close();
+            },
+          }).close;
+          this.relayServers.set(serverId, relayRecord);
+          send({ value: { serverId, address: boundHost, port: boundPort } });
+        } catch (error) {
+          if (serverId !== -1) reg.unregisterServer(serverId);
+          send({ error: error instanceof Error ? error.message : String(error) });
+        }
+      },
+      'net.tls.unlisten': (m, send) => {
+        const serverId = m['serverId'] as number;
+        this.unregisterRelayServer(serverId);
+        reg.unregisterServer(serverId);
+        send({ value: true });
+      },
       'net.listen': (m, send) => {
         const host = (m['host'] as string | undefined) ?? '0.0.0.0';
         const port = (m['port'] as number) | 0;
@@ -1649,6 +2088,9 @@ export class ProcessManager {
             && boundHost !== 'localhost'
             && boundHost !== '::1';
           if (relayEligible) {
+            if (!this.relay!.authorizeListen?.({ hostname: boundHost, port: boundPort, pid: callerPid, tls: false })) {
+              throw new Error('relay listen authorization denied');
+            }
             const relayRecord: RelayServerRecord = { pid: callerPid, dispose: () => {}, socketIds: new Set() };
             relayRecord.dispose = this.relay!.registerListener(boundHost, boundPort, (socket) => {
               const server = reg.findServer(boundHost, boundPort);
@@ -1706,10 +2148,77 @@ export class ProcessManager {
         const port = (m['port'] as number) | 0;
         const srv = reg.findServer(host, port);
         if (!srv) {
+          const pid = callerPid(m);
+          if (this.tcpProvider) {
+            const socketId = reg.allocateSocketId();
+            const record: ExternalTcpSocketRecord = {
+              pid,
+              closed: false,
+              connected: false,
+              pendingWrites: [],
+              shutdownRequested: false,
+              pendingEvents: [],
+            };
+            this.externalTcpSockets.set(socketId, record);
+            // node:net records the returned id first, then awaits this connect event.
+            send({ value: { socketId } });
+            void this.tcpProvider.open(host, port).then((stream) => {
+              if (record.closed || this.externalTcpSockets.get(socketId) !== record) {
+                try { stream.close(); } catch { /* best-effort shutdown */ }
+                return;
+              }
+              record.stream = stream;
+              const dispatchEvent = (kind: 'data' | 'end' | 'error', payload?: unknown): void => {
+                if (record.closed) return;
+                if (!record.connected) {
+                  record.pendingEvents.push({ kind, payload });
+                  return;
+                }
+                if (kind === 'data') {
+                  dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(payload)});`);
+                  return;
+                }
+                if (kind === 'end') {
+                  dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${socketId});`);
+                } else {
+                  dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('error', ${socketId}, ${JSON.stringify(payload)});`);
+                }
+                this.closeExternalTcpSocket(socketId, false);
+              };
+              stream.onData((data) => {
+                dispatchEvent('data', Array.from(data));
+              });
+              stream.onEnd(() => {
+                dispatchEvent('end');
+              });
+              stream.onError((error) => {
+                dispatchEvent('error', formatErr(error));
+              });
+              if (record.closed || this.externalTcpSockets.get(socketId) !== record) return;
+              dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('connect', ${socketId}, ${JSON.stringify({ remoteAddress: host, remotePort: port })});`);
+              if (record.closed || this.externalTcpSockets.get(socketId) !== record) return;
+              for (const data of record.pendingWrites) stream.write(data);
+              record.pendingWrites = [];
+              if (record.shutdownRequested) stream.end();
+              record.connected = true;
+              const pendingEvents = record.pendingEvents;
+              record.pendingEvents = [];
+              for (const event of pendingEvents) dispatchEvent(event.kind, event.payload);
+            }).catch((error) => {
+              if (!record.closed) dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('error', ${socketId}, ${JSON.stringify(formatErr(error))});`);
+              this.closeExternalTcpSocket(socketId, false);
+            });
+            return;
+          }
+          const openExternal = this.netFuncs['net.tcp.open'];
+          if (openExternal) {
+            openExternal({ ...m, host, port, pid }, send);
+            return;
+          }
           send({ error: 'ECONNREFUSED: connect ' + host + ':' + port });
           return;
         }
-        const callerPid = (m['pid'] as number | undefined) ?? forPid ?? 0;
+        const pid = callerPid(m);
         const clientSocketId = reg.allocateSocketId();
         const serverSocketId = reg.allocateSocketId();
 
@@ -1717,13 +2226,13 @@ export class ProcessManager {
         const clientToServer: SocketPair = {
           pushToClient: (chunk) => {
             // server pushing back to the client
-            dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${clientSocketId}, ${JSON.stringify(Array.from(chunk))});`);
+            dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${clientSocketId}, ${JSON.stringify(Array.from(chunk))});`);
           },
           closeClient: () => {
-            dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${clientSocketId});`);
+            dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${clientSocketId});`);
           },
           errorClient: (msg) => {
-            dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('error', ${clientSocketId}, ${JSON.stringify(msg)});`);
+            dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('error', ${clientSocketId}, ${JSON.stringify(msg)});`);
           },
         };
         const serverToClient: SocketPair = {
@@ -1751,18 +2260,45 @@ export class ProcessManager {
       'net.send': (m, send) => {
         const socketId = m['socketId'] as number;
         const data = Uint8Array.from(m['data'] as number[]);
+        const external = this.externalTcpSockets.get(socketId);
+        if (external) {
+          if (external.pid !== callerPid(m)) { send({ error: 'resource belongs to another process' }); return; }
+          if (!external.closed) {
+            if (external.stream) external.stream.write(data);
+            else external.pendingWrites.push(data);
+          }
+          send({ value: true });
+          return;
+        }
         const pair = reg.getPair(socketId);
         if (pair) pair.pushToClient(data);
         send({ value: true });
       },
       'net.shutdown': (m, send) => {
         const socketId = m['socketId'] as number;
+        const external = this.externalTcpSockets.get(socketId);
+        if (external) {
+          if (external.pid !== callerPid(m)) { send({ error: 'resource belongs to another process' }); return; }
+          if (!external.closed && !external.shutdownRequested) {
+            external.shutdownRequested = true;
+            external.stream?.end();
+          }
+          send({ value: true });
+          return;
+        }
         const pair = reg.getPair(socketId);
         if (pair) pair.closeClient();
         send({ value: true });
       },
       'net.close': (m, send) => {
         const socketId = m['socketId'] as number;
+        const external = this.externalTcpSockets.get(socketId);
+        if (external) {
+          if (external.pid !== callerPid(m)) { send({ error: 'resource belongs to another process' }); return; }
+          this.closeExternalTcpSocket(socketId, true);
+          send({ value: true });
+          return;
+        }
         const pair = reg.getPair(socketId);
         if (pair) pair.closeClient();
         reg.removePair(socketId);
@@ -1819,7 +2355,7 @@ export class ProcessManager {
                 s({ value: true });
               },
             };
-            const workerEngine = await createEngine(workerPid, workerFuncs);
+            const workerEngine = await this.engineFactory(workerPid, workerFuncs);
             workerHolder.dispatch = workerEngine.dispatch;
             this.dispatchByPid.set(workerPid, workerEngine.dispatch);
 
@@ -1838,7 +2374,7 @@ export class ProcessManager {
               engine: workerEngine, handle: workerHandle,
               stdinBuffer: [], stdinClosed: true,
               argv: ['node', filename], argv0: 'node', execPath: '/bin/node',
-              env, cwd: '/', title: 'worker', startTime: Date.now(),
+              env, cwd: '/', title: 'worker', startTime: Date.now(), signalListeners: new Set(),
             });
 
             // Build worker entry: set globals + load + run
@@ -1859,6 +2395,7 @@ export class ProcessManager {
             // Wire exit dispatch back to parent
             void workerEngine.exited.then((code) => {
               this.cleanupNetworkForPid(workerPid);
+              this.clearFSWatchSubscriptions(workerPid);
               this.processes.delete(workerPid);
               this.dispatchByPid.delete(workerPid);
               const parentDispatch = dispatchByPid.get(parentPid);
@@ -1884,7 +2421,7 @@ export class ProcessManager {
         const pid = m['pid'] as number;
         const rec = this.processes.get(pid);
         if (rec) {
-          void rec.engine.terminate();
+          void rec.engine?.terminate();
         }
         ok(send, true);
       },
@@ -2001,11 +2538,14 @@ export class ProcessManager {
   }
 
   private async buildEntry(cmd: string, args: string[], env: Record<string, string>, cwd: string): Promise<string> {
-    const argv = [cmd, ...args];
+    const dpmCli = /^\/bin\/(?:dpm|dpx|npm|npx|pnpm)$/.test(cmd);
+    // Bundled DPM CLIs parse Node's executable, script, arguments contract.
+    const argv = dpmCli ? ['/bin/node', cmd, ...args] : [cmd, ...args];
     const prelude =
       `process.argv = ${JSON.stringify(argv)};\n` +
       `process.env = ${JSON.stringify(env)};\n` +
-      `process.chdir(${JSON.stringify(cwd)});\n`;
+      `process.chdir(${JSON.stringify(cwd)});\n` +
+      '';
 
     const builtin = await this.resolveBinary(cmd);
     let body: string;
@@ -2014,20 +2554,15 @@ export class ProcessManager {
     } else {
       body = `(new Function(__fs.readFile(${JSON.stringify(cmd)})))();`;
     }
+    if (body.startsWith('#!')) body = body.slice(body.indexOf('\n') + 1);
 
     // Wrap body in an async IIFE so bundle code that uses fire-and-forget
     // promises (e.g. `main().then(...)`) gets awaited before we check exitCode.
     // We additionally wait one extra microtask cycle to allow chained .then()
     // resolutions a chance to fire.
     //
-    // A body may declare an intent to run long by setting
-    // `globalThis.__process._exitReserved = true`. When set, we DO NOT
-    // auto-exit 0 after the awaited IIFE returns — instead we await
-    // `__process.__mainPromise` (if present) or `__process.__keepAlive`
-    // (a never-resolving promise sentinel). The body is expected to call
-    // `process.exit(N)` itself when done. This lets interactive binaries
-    // (/bin/sh REPL, /bin/node REPL) stay alive across their stdin loops
-    // without top-level `await` in the esbuild IIFE bundle output.
-    return `${prelude}try { await (async () => { ${body}\n })(); await Promise.resolve(); await Promise.resolve(); const __p = globalThis.__process; if (__p && __p._exitReserved && __p._exitCode === undefined) { await (__p.__mainPromise ?? new Promise(function(){})); } if (typeof process !== 'undefined' && process.exit && !(__p && __p._exitCode !== undefined)) process.exit(0); } catch (e) { try { console.error(String(e)); } catch (_) {} try { process.exit(1); } catch (_) {} }`;
+    // A reserved entry without an explicit main promise is an interactive
+    // keep-alive; only a later process.exit can complete it.
+    return `${prelude}try { await (async () => { ${body}\n })(); await Promise.resolve(); await Promise.resolve(); const __p = globalThis.__process; if (__p && __p._exitCode === undefined && __p.__duskLifecycle) { await (__p._exitReserved ? (__p.__mainPromise ?? new Promise(function(){})) : __p.__duskLifecycle.whenIdle()); } if (typeof process !== 'undefined' && process.exit && !(__p && __p._exitCode !== undefined)) process.exit(0); } catch (e) { try { console.error(String(e)); } catch (_) {} try { process.exit(1); } catch (_) {} }`;
   }
 }

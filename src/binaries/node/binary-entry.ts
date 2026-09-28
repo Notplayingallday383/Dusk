@@ -16,5 +16,5 @@ const g = globalThis as Record<string, unknown>;
 if (!g.__process) g.__process = {};
 const procRec = g.__process as ProcRec;
 procRec._exitReserved = true;
-procRec.__mainPromise = main().then((code) => code ?? 0);
+procRec.__mainPromise = main();
 procRec.__mainPromise.catch(() => { /* main errors surface via process.exit */ });

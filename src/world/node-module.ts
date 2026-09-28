@@ -1,0 +1,20 @@
+const builtins = [
+  'assert', 'assert/strict', 'async_hooks', 'buffer', 'child_process', 'cluster',
+  'console', 'constants', 'crypto', 'dns', 'dns/promises', 'events', 'fs',
+  'fs/promises', 'http', 'https', 'net', 'os', 'path', 'perf_hooks', 'process',
+  'querystring', 'readline', 'readline/promises', 'repl', 'stream',
+  'stream/promises', 'string_decoder', 'timers', 'timers/promises', 'tls', 'tty', 'url',
+  'util', 'util/types', 'vm', 'worker_threads', 'zlib',
+];
+
+type Require = ((request: string) => unknown) & { resolve: (request: string) => string };
+
+export const nodeModule = {
+  builtinModules: builtins,
+  createRequire: (filename: string): Require => {
+    const requireFrom = (globalThis as Record<string, unknown>)['__duskRequireFrom'];
+    if (typeof requireFrom !== 'function') throw new Error('require is not installed');
+    const dir = filename.split('/').slice(0, -1).join('/') || '/';
+    return (requireFrom as (fromDir: string) => Require)(dir);
+  },
+};

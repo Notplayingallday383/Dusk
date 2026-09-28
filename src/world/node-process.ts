@@ -196,6 +196,14 @@ class ProcessSingleton extends EventEmitter {
     }
   }
 
+  override on(event: string | symbol, listener: (...args: unknown[]) => void): this {
+    super.on(event, listener);
+    if (event === 'SIGCHLD') {
+      try { __call('process.signal.listen', { pid: this.pid, signal: event }); } catch { /* optional host capability */ }
+    }
+    return this;
+  }
+
   exit(code?: number): void {
     const effective = code ?? this.exitCode ?? 0;
     this.exitCode = effective;
@@ -404,16 +412,22 @@ const makeFallbackWritable = (fd: number, pid: number): unknown => {
   return makeProcWriteFallback(fd);
 };
 
-const makeFallbackReadable = (): { read: () => Uint8Array | null; isTTY?: boolean } => {
-  return {
-    read(): Uint8Array | null {
+const makeFallbackReadable = (): EventEmitter & { read: () => Uint8Array | null; resume: () => EventEmitter; pause: () => EventEmitter; isTTY?: boolean } => {
+  const stream = new EventEmitter() as EventEmitter & {
+    read: () => Uint8Array | null;
+    resume: () => EventEmitter;
+    pause: () => EventEmitter;
+  };
+  stream.read = (): Uint8Array | null => {
       try {
         const v = __call('proc.readStdin') as number[] | null;
         if (v === null) return null;
         return new Uint8Array(v);
       } catch { return null; }
-    },
   };
+  stream.resume = (): EventEmitter => stream;
+  stream.pause = (): EventEmitter => stream;
+  return stream;
 };
 
 export const installNodeProcess = (): ProcessSingleton => {

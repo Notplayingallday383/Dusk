@@ -15,6 +15,7 @@
     "skipLibCheck": true,
     "types": ["vite/client"],
     "paths": {
+      "@nightnetwork/dusk": ["./src/index.ts"],
       "@terbiumos/tfs/browser": ["./src/types/tfs-browser.d.ts"]
     },
     "outDir": "dist"

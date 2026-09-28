@@ -73,6 +73,7 @@ export const main = async (): Promise<number> => {
       await runScript(scriptPath);
     }
     await waitForActiveHandles();
+    await (globalThis as { __process?: { __duskLifecycle?: { whenIdle(): Promise<void> } } }).__process?.__duskLifecycle?.whenIdle();
     proc?.exit?.(0);
     return 0;
   } catch (e) {
@@ -133,6 +134,13 @@ const runScript = async (path: string): Promise<unknown> => {
   const module = { exports: {} as unknown };
   const fn = (0, eval)('(function(exports, require, module, __filename, __dirname){' + source + '\n})') as (e: unknown, r: unknown, m: unknown, fn: string, dn: string) => unknown;
   fn(module.exports, req, module, path, dir);
+  const binTarget = (globalThis as Record<string, unknown>)['__duskBinTarget'];
+  if (typeof binTarget === 'string') {
+    delete (globalThis as Record<string, unknown>)['__duskBinTarget'];
+    const proc = (globalThis as Record<string, unknown>)['process'] as { argv: string[] } | undefined;
+    if (proc) proc.argv[1] = binTarget;
+    return runScript(binTarget);
+  }
   return module.exports;
 };
 

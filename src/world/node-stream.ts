@@ -165,6 +165,7 @@ export class Readable extends EventEmitter {
     if (this.readableFlowing !== true) {
       this.readableFlowing = true;
       this.emit('resume');
+      if (this._buffer.length === 0 && !this._ended) this._read(this.readableHighWaterMark);
       this._flushFlow();
     }
     return this;
@@ -670,3 +671,10 @@ export const nodeStream = {
   default: undefined as unknown,
 };
 (nodeStream as { default: unknown }).default = nodeStream;
+
+export const nodeStreamPromises = {
+  finished: (stream: Readable | Writable): Promise<void> => new Promise((resolve, reject) => {
+    finished(stream, (error) => error ? reject(error) : resolve());
+  }),
+  pipeline: (...streams: Array<Readable | Writable>): Promise<void> => pipeline(...streams) as Promise<void>,
+};

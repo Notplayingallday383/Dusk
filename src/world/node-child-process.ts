@@ -81,10 +81,14 @@ const decodeUtf8 = (bytes: Uint8Array): string => {
 
 interface PendingProcess {
   onData: ((stream: 'stdout' | 'stderr', chunk: Uint8Array) => void)[];
+  onStreamEnd: ((stream: 'stdout' | 'stderr') => void)[];
   onExit: ((code: number) => void)[];
   onError: ((e: Error) => void)[];
   stdoutStreamId?: number;
   stderrStreamId?: number;
+  stdoutEnded?: boolean;
+  stderrEnded?: boolean;
+  exited?: boolean;
 }
 
 const pendingProcesses = new Map<number, PendingProcess>();
@@ -117,21 +121,42 @@ const g = globalThis as Record<string, unknown>;
 const existing = g['__process'] as Record<string, unknown> | undefined;
 const procState: Record<string, unknown> = existing ?? {};
 if (!existing) g['__process'] = procState;
+// A process entry must outlive its `exit` event. The host dispatches `exit`
+// off child.exit, independently of the stdout/stderr pumps, so a chunk parked
+// on the host credit gate can still arrive afterwards. Deleting the entry at
+// `exit` silently discarded those chunks (and their credit grants), truncating
+// output under load. Release the entry only once the process has exited AND
+// both pipes have delivered their end-of-stream sentinel.
+const releaseIfComplete = (pid: number, p: PendingProcess): void => {
+  if (p.exited === true && p.stdoutEnded === true && p.stderrEnded === true) {
+    pendingProcesses.delete(pid);
+  }
+};
+
 procState['dispatch'] = (pid: number, event: string, data: unknown): void => {
   const p = pendingProcesses.get(pid);
   if (!p) return;
   if (event === 'stdout' || event === 'stderr') {
     // `null` payload is the end-of-stream sentinel — host has already
-    // cleared the registry entry, so no credit grant is needed.
-    if (data === null) return;
+    // cleared the registry entry, so no credit grant is needed. This is the
+    // only place a stream's 'end' is announced, which guarantees 'end' can
+    // never be observed before the stream's last data chunk.
+    if (data === null) {
+      if (event === 'stdout') p.stdoutEnded = true;
+      else p.stderrEnded = true;
+      for (const cb of p.onStreamEnd) cb(event);
+      releaseIfComplete(pid, p);
+      return;
+    }
     const arr = data as number[];
     const bytes = makeBuffer(new Uint8Array(arr));
     for (const cb of p.onData) cb(event, bytes);
     const streamId = event === 'stdout' ? p.stdoutStreamId : p.stderrStreamId;
     if (streamId !== undefined) grant(streamId, arr.length);
   } else if (event === 'exit') {
+    p.exited = true;
     for (const cb of p.onExit) cb(data as number);
-    pendingProcesses.delete(pid);
+    releaseIfComplete(pid, p);
   } else if (event === 'error') {
     for (const cb of p.onError) cb(new Error(String(data)));
     pendingProcesses.delete(pid);
@@ -143,6 +168,7 @@ type ChildEvent = 'exit' | 'close' | 'error' | 'spawn';
 class ChildProcess {
   pid: number;
   exit: Promise<number>;
+  stdin: { write(data: Uint8Array): boolean; end(): void };
   stdout: { on(event: 'data' | 'end', cb: (data?: Uint8Array) => void): void };
   stderr: { on(event: 'data' | 'end', cb: (data?: Uint8Array) => void): void };
   private _exitResolve!: (code: number) => void;
@@ -154,6 +180,8 @@ class ChildProcess {
   private _stderrBacklog: Uint8Array[] = [];
   private _stdoutListening = false;
   private _stderrListening = false;
+  private _stdoutEnded = false;
+  private _stderrEnded = false;
   private _ended = false;
   private _exitCode: number | null = null;
   private _errorValue: Error | null = null;
@@ -165,6 +193,13 @@ class ChildProcess {
   constructor(pid: number, stdoutStreamId?: number, stderrStreamId?: number) {
     this.pid = pid;
     this.exit = new Promise<number>((resolve) => { this._exitResolve = resolve; });
+    this.stdin = {
+      write: (data: Uint8Array): boolean => {
+        call('process.stdinWrite', { pid, data: Array.from(data) });
+        return true;
+      },
+      end: (): void => { call('process.stdinClose', { pid }); },
+    };
     const self = this;
     this.stdout = {
       on(event, cb) {
@@ -177,7 +212,7 @@ class ChildProcess {
         } else if (event === 'end') {
           const endCb = cb as () => void;
           self._stdoutEndCbs.push(endCb);
-          if (self._ended) endCb();
+          if (self._stdoutEnded) endCb();
         }
       },
     };
@@ -192,7 +227,7 @@ class ChildProcess {
         } else if (event === 'end') {
           const endCb = cb as () => void;
           self._stderrEndCbs.push(endCb);
-          if (self._ended) endCb();
+          if (self._stderrEnded) endCb();
         }
       },
     };
@@ -207,11 +242,23 @@ class ChildProcess {
           else this._stderrBacklog.push(chunk);
         }
       }],
+      onStreamEnd: [(stream) => {
+        // 'end' means real stream EOF, never "the process exited". Firing it
+        // from onExit raced the pumps and let consumers stop reading while
+        // chunks were still in flight.
+        if (stream === 'stdout') {
+          if (this._stdoutEnded) return;
+          this._stdoutEnded = true;
+          for (const cb of this._stdoutEndCbs) cb();
+        } else {
+          if (this._stderrEnded) return;
+          this._stderrEnded = true;
+          for (const cb of this._stderrEndCbs) cb();
+        }
+      }],
       onExit: [(code) => {
         this._ended = true;
         this._exitCode = code;
-        for (const cb of this._stdoutEndCbs) cb();
-        for (const cb of this._stderrEndCbs) cb();
         for (const cb of this._exitListeners.slice()) { try { cb(code); } catch (e) { this._reportListenerError(e); } }
         for (const cb of this._closeListeners.slice()) { try { cb(code); } catch (e) { this._reportListenerError(e); } }
         this._exitResolve(code);
@@ -221,8 +268,13 @@ class ChildProcess {
         for (const cb of this._errorListeners.slice()) { try { cb(e); } catch (err) { this._reportListenerError(err); } }
       }],
     };
+    // No stream id means the host never wired a pump for that pipe, so no EOF
+    // sentinel will ever arrive. Treat it as already ended so 'end' listeners
+    // still fire and the entry is still releasable on exit.
     if (stdoutStreamId !== undefined) pending.stdoutStreamId = stdoutStreamId;
+    else { pending.stdoutEnded = true; this._stdoutEnded = true; }
     if (stderrStreamId !== undefined) pending.stderrStreamId = stderrStreamId;
+    else { pending.stderrEnded = true; this._stderrEnded = true; }
     pendingProcesses.set(pid, pending);
   }
 

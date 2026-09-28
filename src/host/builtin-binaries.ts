@@ -21,66 +21,67 @@ export const BUILTIN_BINARIES: Record<string, string> = {
   '/bin/hostname': "(function(){ try { var h = __fs.readFile('/etc/hostname'); process.stdout.write(h.replace(/\\n+$/, '') + '\\n'); } catch (e) { process.stdout.write('duskjs\\n'); } })();",
   // clear: emit ANSI clear-screen (works on real terminals; harmless in <pre>).
   '/bin/clear': 'process.stdout.write("\\x1b[2J\\x1b[H");',
-  // curl: minimal HTTP client backed by globalThis.fetch (which world/net.ts
-  // installs and routes through Nova). Supports: -X METHOD, -H 'K: V',
-  // -d BODY (implies -X POST), -o FILE, -s (silent — omit progress lines),
-  // -i (include response headers in output), -L (follow redirects; default),
-  // -v (verbose to stderr), --url URL, and bare positional URL.
+  // curl: focused HTTP client backed by globalThis.fetch, which world/net.ts
+  // routes through the configured Nova LibCurl. Deliberately reject flags
+  // outside this contract rather than silently claiming curl compatibility.
   '/bin/curl': "#!/bin/node\n(async function(){\n" +
     "  // When routed through /bin/node, process.argv = ['node', scriptPath, ...userArgs].\n" +
     "  // slice(2) skips both to get only the user args.\n" +
     "  var argv = process.argv.slice(2);\n" +
     "  if (argv.length === 0) { process.stderr.write('curl: try \\'curl --help\\' for more information\\n'); process.exit(2); }\n" +
     "  if (argv[0] === '--help' || argv[0] === '-h') {\n" +
-    "    process.stdout.write('Usage: curl [options] <url>\\n  -X, --request METHOD    HTTP method (default GET)\\n  -H, --header \\'K: V\\'   Add request header (repeatable)\\n  -d, --data BODY         Request body (sets method to POST unless -X used)\\n  -o FILE                 Write body to FILE instead of stdout\\n  -s, --silent            Silent mode\\n  -i, --include           Include response headers in output\\n  -v, --verbose           Verbose logging to stderr\\n  --url URL               Explicit URL flag\\n');\n" +
+    "    process.stdout.write('Usage: curl [options] <url>\\n  -X, --request METHOD    HTTP method (default GET)\\n  -H, --header \\'K: V\\'   Add request header (repeatable)\\n  -d, --data BODY         Request body (sets method to POST unless -X used)\\n  -o, --output FILE       Write output to FILE instead of stdout\\n  -s, --silent            Suppress informational diagnostics\\n  -i, --include           Include response headers in output\\n  -L, --location          Follow redirects (off by default)\\n  -v, --verbose           Verbose logging to stderr\\n  --url URL               Explicit URL flag\\n');\n" +
     "    return;\n" +
     "  }\n" +
     "  var url = null; var method = null; var headers = {}; var body = null;\n" +
-    "  var outFile = null; var silent = false; var include = false; var verbose = false;\n" +
+    "  var outFile = null; var silent = false; var include = false; var verbose = false; var location = false;\n" +
+    "  function optionValue(flag) { if (i + 1 >= argv.length) { process.stderr.write('curl: option requires an argument: ' + flag + '\\n'); process.exit(2); return null; } return argv[++i]; }\n" +
     "  for (var i = 0; i < argv.length; i++) {\n" +
     "    var a = argv[i];\n" +
-    "    if (a === '-X' || a === '--request') { method = argv[++i]; }\n" +
+    "    if (a === '-X' || a === '--request') { method = optionValue(a); if (method === null) return; }\n" +
     "    else if (a === '-H' || a === '--header') {\n" +
-    "      var h = argv[++i] || ''; var idx = h.indexOf(':');\n" +
-    "      if (idx > 0) headers[h.slice(0, idx).trim()] = h.slice(idx + 1).trim();\n" +
+    "      var h = optionValue(a); if (h === null) return; var idx = h.indexOf(':');\n" +
+    "      if (idx <= 0) { process.stderr.write('curl: invalid header: ' + h + '\\n'); process.exit(2); return; } headers[h.slice(0, idx).trim()] = h.slice(idx + 1).trim();\n" +
     "    }\n" +
-    "    else if (a === '-d' || a === '--data' || a === '--data-raw') { body = argv[++i]; if (!method) method = 'POST'; }\n" +
-    "    else if (a === '-o' || a === '--output') { outFile = argv[++i]; }\n" +
+    "    else if (a === '-d' || a === '--data' || a === '--data-raw') { body = optionValue(a); if (body === null) return; if (!method) method = 'POST'; }\n" +
+    "    else if (a === '-o' || a === '--output') { outFile = optionValue(a); if (outFile === null) return; }\n" +
     "    else if (a === '-s' || a === '--silent') { silent = true; }\n" +
     "    else if (a === '-i' || a === '--include') { include = true; }\n" +
     "    else if (a === '-v' || a === '--verbose') { verbose = true; }\n" +
-    "    else if (a === '-L' || a === '--location') { /* default */ }\n" +
-    "    else if (a === '--url') { url = argv[++i]; }\n" +
+    "    else if (a === '-L' || a === '--location') { location = true; }\n" +
+    "    else if (a === '--url') { url = optionValue(a); if (url === null) return; }\n" +
     "    else if (a && a.charAt(0) !== '-') { url = a; }\n" +
-    "    else if (a && a.charAt(0) === '-') { /* ignore unknown flags */ }\n" +
+    "    else if (a && a.charAt(0) === '-') { process.stderr.write('curl: unsupported option: ' + a + '\\n'); process.exit(2); return; }\n" +
     "  }\n" +
     "  if (!url) { process.stderr.write('curl: no URL specified\\n'); process.exit(2); }\n" +
     "  if (!/^https?:\\/\\//i.test(url)) url = 'https://' + url;\n" +
     "  if (verbose) process.stderr.write('* ' + (method || 'GET') + ' ' + url + '\\n');\n" +
     "  try {\n" +
-    "    var opts = { method: method || 'GET', headers: headers };\n" +
+    "    var opts = { method: method || 'GET', headers: headers, redirect: location ? 'follow' : 'manual' };\n" +
     "    if (body != null) opts.body = body;\n" +
     "    var res = await fetch(url, opts);\n" +
+    "    var header = '';\n" +
     "    if (verbose || include) {\n" +
     "      var statusLine = 'HTTP/1.1 ' + res.status + ' ' + (res.statusText || '');\n" +
     "      if (verbose) process.stderr.write('< ' + statusLine + '\\n');\n" +
-    "      if (include) process.stdout.write(statusLine + '\\n');\n" +
+    "      if (include) header += statusLine + '\\r\\n';\n" +
     "      if (res.headers && typeof res.headers.forEach === 'function') {\n" +
     "        res.headers.forEach(function(v, k) {\n" +
     "          var line = k + ': ' + v;\n" +
     "          if (verbose) process.stderr.write('< ' + line + '\\n');\n" +
-    "          if (include) process.stdout.write(line + '\\n');\n" +
+    "          if (include) header += line + '\\r\\n';\n" +
     "        });\n" +
     "      }\n" +
-    "      if (include) process.stdout.write('\\n');\n" +
+    "      if (include) header += '\\r\\n';\n" +
     "    }\n" +
-    "    var text = await res.text();\n" +
-    "    if (outFile) { __fs.writeFile(outFile, text); if (!silent) process.stderr.write('curl: wrote ' + text.length + ' bytes to ' + outFile + '\\n'); }\n" +
-    "    else { process.stdout.write(text); }\n" +
+    "    var bodyBytes = new Uint8Array(await res.arrayBuffer()); var headerBytes = new TextEncoder().encode(header); var output = new Uint8Array(headerBytes.length + bodyBytes.length); output.set(headerBytes); output.set(bodyBytes, headerBytes.length);\n" +
+    "    if (outFile) { require('fs').writeFileSync(outFile, output); if (!silent) process.stderr.write('curl: wrote ' + output.length + ' bytes to ' + outFile + '\\n'); }\n" +
+    "    else { ipc.send({ f: 'proc.write', fd: 1, data: Array.from(output) }); }\n" +
     "    if (!res.ok && !include && !silent) process.stderr.write('curl: HTTP ' + res.status + ' ' + (res.statusText || '') + '\\n');\n" +
     "    process.exit(res.ok ? 0 : (res.status >= 400 ? 22 : 0));\n" +
     "  } catch (e) {\n" +
-    "    process.stderr.write('curl: (' + ((e && e.name) || 'Error') + ') ' + ((e && e.message) || String(e)) + '\\n');\n" +
+    "    var detail = (e && e.message) || String(e); var lower = String(detail).toLowerCase(); var category = lower.indexOf('dns') >= 0 || lower.indexOf('getaddrinfo') >= 0 || lower.indexOf('enotfound') >= 0 ? 'DNS' : lower.indexOf('timeout') >= 0 || lower.indexOf('timed out') >= 0 ? 'timeout' : lower.indexOf('tls') >= 0 || lower.indexOf('ssl') >= 0 || lower.indexOf('certificate') >= 0 ? 'TLS' : lower.indexOf('connect') >= 0 || lower.indexOf('refused') >= 0 || lower.indexOf('econn') >= 0 ? 'connect' : lower.indexOf('unavailable') >= 0 || lower.indexOf('not supported') >= 0 ? 'unavailable' : 'transport';\n" +
+    "    process.stderr.write('curl: (' + category + ') ' + detail + '\\n');\n" +
     "    process.exit(6);\n" +
     "  }\n" +
     "})();",
@@ -88,10 +89,21 @@ export const BUILTIN_BINARIES: Record<string, string> = {
   // else writes body to a filename derived from the URL path. Supports:
   // -O FILE (explicit output), -q (quiet), and positional URL.
   '/bin/wget': "#!/bin/node\n(async function(){\n" +
-    "  // slice(2) skips ['node', scriptPath] — same as curl.\n" +
-    "  var argv = process.argv.slice(2);\n" +
-    "  if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {\n" +
-    "    process.stdout.write('Usage: wget [-q] [-O FILE] <url>\\n'); process.exit(argv.length === 0 ? 1 : 0);\n" +
+    "  // Derive args from argv0 rather than a fixed slice(2): a direct spawn\n" +
+    "  // gives ['/bin/wget', ...] while a shebang route gives ['node',\n" +
+    "  // '/bin/wget', ...], so slice(2) ate the first real arg when spawned\n" +
+    "  // directly.\n" +
+    "  var raw = process.argv || [];\n" +
+    "  var start = 0;\n" +
+    "  for (var k = 0; k < raw.length; k++) { if (/wget$/.test(String(raw[k]))) { start = k + 1; break; } }\n" +
+    "  var argv = raw.slice(start);\n" +
+    "  // process.exit() does not unwind the calling frame in this runtime, so\n" +
+    "  // every exit path must return as well (same shape as /bin/curl).\n" +
+    "  if (argv.length === 0) {\n" +
+    "    process.stdout.write('Usage: wget [-q] [-O FILE] <url>\\n'); process.exit(1); return;\n" +
+    "  }\n" +
+    "  if (argv[0] === '--help' || argv[0] === '-h') {\n" +
+    "    process.stdout.write('Usage: wget [-q] [-O FILE] <url>\\n'); return;\n" +
     "  }\n" +
     "  var url = null; var outFile = null; var quiet = false;\n" +
     "  for (var i = 0; i < argv.length; i++) {\n" +

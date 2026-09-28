@@ -1,5 +1,39 @@
 import { test, expect } from 'vitest';
 import { bootRepl } from '../src/index';
+import type { TcpStream } from '../src/host/tcp';
+
+class GuestTcpStream implements TcpStream {
+  private endHandler: (() => void) | undefined;
+  write(_data: Uint8Array): void {}
+  end(): void { this.endHandler?.(); }
+  close(): void {}
+  onData(_callback: (data: Uint8Array) => void): void {}
+  onEnd(callback: () => void): void { this.endHandler = callback; }
+  onError(_callback: (error: unknown) => void): void {}
+}
+
+test('node:net waits for host outbound TCP connect dispatch', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((text) => out.push(text), {
+    fs: 'memory',
+    net: { tcpProvider: { open: async () => new GuestTcpStream() } },
+  });
+  try {
+    await repl.feed([
+      "const net = require('node:net');",
+      "const client = net.connect({ host: 'ssh.example.test', port: 22 });",
+      "client.once('connect', () => { process.stdout.write('TCP-GUEST=' + client.remoteAddress + ':' + client.remotePort + ':END'); client.end(); });",
+      '',
+    ].join(' '));
+    const deadline = Date.now() + 10_000;
+    while (!out.join('').includes(':END') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(out.join('')).toContain('TCP-GUEST=ssh.example.test:22:END');
+  } finally {
+    await repl.engine.terminate();
+  }
+}, 60_000);
 
 // Note: plan's original test code used `new TextDecoder().decode(chunk)`, but
 // TextDecoder is not defined in this SpiderMonkey engine build. Using

@@ -7,6 +7,7 @@
 
 import type { IFileSystem } from "../fs/interface.js";
 import type { Command, CommandRegistry } from "../types.js";
+import { isBrowserExcludedCommand } from "../commands/browser-excluded.js";
 import type { InterpreterState } from "./types.js";
 
 /**
@@ -129,7 +130,14 @@ export async function resolveCommand(
         // Determine if this is a system directory where command stubs live
         const isSystemDir = dir === "/bin" || dir === "/usr/bin";
 
-        if (cmd && isSystemDir) {
+        // Browser-excluded commands still have generated stubs in system
+        // directories. A DPM-installed shim at the same path must run instead.
+        const isBrowserExcluded = isBrowserExcludedCommand(commandName);
+        const isGeneratedStub = cmd && isBrowserExcluded
+          ? (await ctx.fs.readFile(fullPath)).startsWith(`#!/bin/bash\n# Built-in command: ${commandName}\n`)
+          : false;
+
+        if (cmd && isSystemDir && (!isBrowserExcluded || isGeneratedStub)) {
           // Registered commands in system directories work without execute bits
           // (they're our internal implementations with stub files)
           return { cmd, path: fullPath };
@@ -137,7 +145,7 @@ export async function resolveCommand(
 
         // For non-system directories (or non-registered commands), require executable
         if (isExecutable) {
-          if (cmd && !isSystemDir) {
+          if (cmd && (!isSystemDir || (isBrowserExcluded && !isGeneratedStub))) {
             // User script shadows a registered command - treat as script
             return { script: true, path: fullPath };
           }

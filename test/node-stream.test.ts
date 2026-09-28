@@ -29,3 +29,18 @@ test('node:stream Readable.from + Writable + pipe end-of-stream', async () => {
   expect(s).toContain('count=3');
   expect(s).toContain('finished=true');
 }, 60_000);
+
+test('node:stream begins a read-driven source when a data listener is attached', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((text) => out.push(text), { fs: 'memory' });
+  await repl.feed(
+    "const { Readable } = require('node:stream'); " +
+    "const source = new Readable({ read() { this.push('value'); this.push(null); } }); " +
+    "source.on('data', (chunk) => process.stdout.write(String(chunk)));\n",
+  );
+  const deadline = Date.now() + 1_000;
+  while (!out.join('').includes('value') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  await repl.engine.terminate();
+
+  expect(out.join('')).toContain('value');
+}, 60_000);

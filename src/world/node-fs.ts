@@ -64,6 +64,35 @@ const bytesToString = (b: Uint8Array, encoding?: string): string => {
   return s;
 };
 
+const invalidPath = (): never => {
+  const error = new TypeError('The "path" argument must be of type string or an instance of URL');
+  (error as Error & { code?: string }).code = 'ERR_INVALID_ARG_TYPE';
+  throw error;
+};
+
+const normalizePath = (path: unknown): string => {
+  if (typeof path === 'string') return path;
+  if (!path || typeof path !== 'object') return invalidPath();
+  const url = path as { protocol?: unknown; hostname?: unknown; pathname?: unknown };
+  if (url.protocol !== 'file:') {
+    const error = new TypeError('The URL must be of scheme file:');
+    (error as Error & { code?: string }).code = 'ERR_INVALID_URL_SCHEME';
+    throw error;
+  }
+  if (url.hostname !== '') {
+    const error = new TypeError('File URL host must be empty or localhost');
+    (error as Error & { code?: string }).code = 'ERR_INVALID_FILE_URL_HOST';
+    throw error;
+  }
+  if (typeof url.pathname !== 'string') return invalidPath();
+  if (/%2f|%5c/i.test(url.pathname)) {
+    const error = new TypeError('File URL path must not include encoded slash characters');
+    (error as Error & { code?: string }).code = 'ERR_INVALID_FILE_URL_PATH';
+    throw error;
+  }
+  return decodeURIComponent(url.pathname);
+};
+
 // ---- Stats ----
 
 interface RawStat {
@@ -83,6 +112,7 @@ class Stats {
   atimeMs: number;
   ctimeMs: number;
   birthtimeMs: number;
+  mtimeKnown: boolean;
   mode: number;
   uid = 1000;
   gid = 1000;
@@ -100,11 +130,11 @@ class Stats {
     this._isFile = raw.isFile;
     this._isDirectory = raw.isDirectory;
     this.size = raw.size ?? 0;
-    const now = Date.now();
-    this.mtimeMs = raw.mtimeMs ?? now;
-    this.atimeMs = raw.atimeMs ?? now;
-    this.ctimeMs = raw.ctimeMs ?? now;
-    this.birthtimeMs = raw.birthtimeMs ?? now;
+    this.mtimeMs = raw.mtimeMs ?? 0;
+    this.mtimeKnown = raw.mtimeMs !== undefined;
+    this.atimeMs = raw.atimeMs ?? 0;
+    this.ctimeMs = raw.ctimeMs ?? 0;
+    this.birthtimeMs = raw.birthtimeMs ?? 0;
     this.mode = raw.mode ?? (raw.isDirectory ? 0o40755 : 0o100644);
     this.blocks = Math.ceil(this.size / 512);
   }
@@ -131,7 +161,7 @@ const wrapStat = (raw: RawStat): Stats => new Stats(raw);
 // write/close/fstat/ftruncate/fsync funcs). Engine just forwards.
 
 const _openSync = (path: string, flags: string | number, mode?: number): number => {
-  return call('fs.open', { path, flags, mode }) as number;
+  return call('fs.open', { path: normalizePath(path), flags, mode }) as number;
 };
 
 const _closeSync = (fd: number): void => {
@@ -172,7 +202,7 @@ const _fstatSync = (fd: number): Stats => {
 // ---- sync API ----
 
 const readFileSync = (path: string, optsOrEnc?: string | { encoding?: string }): unknown => {
-  const data = call('fs.readFile', { path }) as string;
+  const data = call('fs.readFile', { path: normalizePath(path) }) as string;
   const encoding = typeof optsOrEnc === 'string' ? optsOrEnc : optsOrEnc?.encoding;
   if (encoding) return data; // already string; FS backend returns utf8
   return toBuffer(data);
@@ -180,104 +210,127 @@ const readFileSync = (path: string, optsOrEnc?: string | { encoding?: string }):
 
 const writeFileSync = (path: string, data: unknown, _opts?: unknown): void => {
   const text = typeof data === 'string' ? data : bytesToString(toBuffer(data), 'utf8');
-  call('fs.writeFile', { path, data: text });
+  call('fs.writeFile', { path: normalizePath(path), data: text });
 };
 
 const appendFileSync = (path: string, data: unknown, _opts?: unknown): void => {
+  const filePath = normalizePath(path);
   let existing = '';
-  try { existing = call('fs.readFile', { path }) as string; } catch { /* */ }
+  try { existing = call('fs.readFile', { path: filePath }) as string; } catch { /* */ }
   const text = typeof data === 'string' ? data : bytesToString(toBuffer(data), 'utf8');
-  call('fs.writeFile', { path, data: existing + text });
+  call('fs.writeFile', { path: filePath, data: existing + text });
 };
 
-const readdirSync = (path: string, _opts?: unknown): string[] => {
-  return call('fs.readdir', { path }) as string[];
+interface Dirent {
+  name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+const readdirSync = (path: string, opts?: { withFileTypes?: boolean }): string[] | Dirent[] => {
+  const names = call('fs.readdir', { path: normalizePath(path) }) as string[];
+  if (!opts?.withFileTypes) return names;
+  const base = normalizePath(path);
+  return names.map((name) => {
+    const stat = lstatSync(base === '/' ? '/' + name : base + '/' + name);
+    return {
+      name,
+      isFile: () => stat.isFile(),
+      isDirectory: () => stat.isDirectory(),
+      isSymbolicLink: () => stat.isSymbolicLink(),
+    };
+  });
 };
 
 const mkdirSync = (path: string, opts?: { recursive?: boolean } | number): void => {
   const recursive = typeof opts === 'object' && opts ? opts.recursive : false;
-  call('fs.mkdir', { path, recursive: Boolean(recursive) });
+  call('fs.mkdir', { path: normalizePath(path), recursive: Boolean(recursive) });
 };
 
 const rmSync = (path: string, opts?: { recursive?: boolean; force?: boolean }): void => {
-  try { call('fs.rm', { path, recursive: Boolean(opts?.recursive) }); }
+  try { call('fs.rm', { path: normalizePath(path), recursive: Boolean(opts?.recursive) }); }
   catch (e) { if (!opts?.force) throw e; }
 };
 
 const rmdirSync = (path: string, opts?: { recursive?: boolean }): void => {
-  call('fs.rm', { path, recursive: Boolean(opts?.recursive) });
+  call('fs.rm', { path: normalizePath(path), recursive: Boolean(opts?.recursive) });
 };
 
 const unlinkSync = (path: string): void => {
-  call('fs.rm', { path, recursive: false });
+  call('fs.rm', { path: normalizePath(path), recursive: false });
 };
 
 const existsSync = (path: string): boolean => {
-  try { return call('fs.exists', { path }) === true; } catch { return false; }
+  const filePath = normalizePath(path);
+  try { return call('fs.exists', { path: filePath }) === true; } catch { return false; }
 };
 
 const statSync = (path: string, _opts?: unknown): Stats => {
-  return wrapStat(call('fs.stat', { path }) as RawStat);
+  return wrapStat(call('fs.stat', { path: normalizePath(path) }) as RawStat);
 };
 
 const lstatSync = (path: string): Stats => {
   try {
-    return wrapStat(call('fs.lstat', { path }) as RawStat);
+    return wrapStat(call('fs.lstat', { path: normalizePath(path) }) as RawStat);
   } catch {
-    return wrapStat(call('fs.stat', { path }) as RawStat);
+    return wrapStat(call('fs.stat', { path: normalizePath(path) }) as RawStat);
   }
 };
 
 const symlinkSync = (target: string, path: string, _type?: string): void => {
-  call('fs.symlink', { target, path });
+  call('fs.symlink', { target: normalizePath(target), path: normalizePath(path) });
 };
 
 const readlinkSync = (path: string, _opts?: unknown): string => {
-  return call('fs.readlink', { path }) as string;
+  return call('fs.readlink', { path: normalizePath(path) }) as string;
 };
 
 const renameSync = (from: string, to: string): void => {
-  call('fs.rename', { from, to });
+  call('fs.rename', { from: normalizePath(from), to: normalizePath(to) });
 };
 
 const copyFileSync = (src: string, dest: string, _mode?: number): void => {
-  const data = call('fs.readFile', { path: src }) as string;
-  call('fs.writeFile', { path: dest, data });
+  const data = call('fs.readFile', { path: normalizePath(src) }) as string;
+  call('fs.writeFile', { path: normalizePath(dest), data });
 };
 
 const accessSync = (path: string, _mode?: number): void => {
-  if (call('fs.exists', { path }) !== true) {
-    throw errnoError('ENOENT', 'access', path);
+  const filePath = normalizePath(path);
+  if (call('fs.exists', { path: filePath }) !== true) {
+    throw errnoError('ENOENT', 'access', filePath);
   }
 };
 
 const realpathSync = (path: string): string => {
+  const filePath = normalizePath(path);
   // No symlinks yet — return path as-is if it exists
-  if (call('fs.exists', { path }) !== true) {
-    throw errnoError('ENOENT', 'realpath', path);
+  if (call('fs.exists', { path: filePath }) !== true) {
+    throw errnoError('ENOENT', 'realpath', filePath);
   }
-  return path;
+  return filePath;
 };
 
 const truncateSync = (path: string, len = 0): void => {
+  const filePath = normalizePath(path);
   let existing = '';
-  try { existing = call('fs.readFile', { path }) as string; } catch { /* */ }
+  try { existing = call('fs.readFile', { path: filePath }) as string; } catch { /* */ }
   const bytes = toBuffer(existing);
-  if (len < bytes.length) call('fs.writeFile', { path, data: bytesToString(bytes.subarray(0, len), 'utf8') });
+  if (len < bytes.length) call('fs.writeFile', { path: filePath, data: bytesToString(bytes.subarray(0, len), 'utf8') });
   else if (len > bytes.length) {
     const expanded = new Uint8Array(len);
     expanded.set(bytes);
-    call('fs.writeFile', { path, data: bytesToString(expanded, 'utf8') });
+    call('fs.writeFile', { path: filePath, data: bytesToString(expanded, 'utf8') });
   }
 };
 
-const chmodSync = (_path: string, _mode: number): void => { /* no-op */ };
+const chmodSync = (path: string, _mode: number): void => { normalizePath(path); };
 const fchmodSync = (_fd: number, _mode: number): void => { /* no-op */ };
 const lchmodSync = chmodSync;
-const chownSync = (_path: string, _uid: number, _gid: number): void => { /* no-op */ };
+const chownSync = (path: string, _uid: number, _gid: number): void => { normalizePath(path); };
 const fchownSync = (_fd: number, _uid: number, _gid: number): void => { /* no-op */ };
 const lchownSync = chownSync;
-const utimesSync = (_path: string, _atime: Date | number, _mtime: Date | number): void => { /* no-op */ };
+const utimesSync = (path: string, _atime: Date | number, _mtime: Date | number): void => { normalizePath(path); };
 const lutimesSync = utimesSync;
 const futimesSync = (_fd: number, _atime: Date | number, _mtime: Date | number): void => { /* no-op */ };
 
@@ -331,8 +384,9 @@ const appendFile = (path: string, data: unknown, optsOrCb?: unknown, maybeCb?: C
 
 const readdir = (path: string, optsOrCb?: unknown, maybeCb?: Cb): void => {
   const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as Cb | undefined;
+  const opts = typeof optsOrCb === 'object' && optsOrCb ? optsOrCb as { withFileTypes?: boolean } : undefined;
   defer(() => {
-    try { cb?.(null, readdirSync(path)); }
+    try { cb?.(null, readdirSync(path, opts as { withFileTypes?: boolean })); }
     catch (e) { cb?.(e instanceof Error ? e : new Error(String(e))); }
   });
 };
@@ -538,13 +592,14 @@ const utimes = wrapSync(utimesSync);
 const lutimes = wrapSync(lutimesSync);
 const futimes = wrapSync(futimesSync);
 
-// ---- watch / watchFile / unwatchFile (poll-based) ----
-//
-// FS backends here don't expose change events, so we poll stat() at an interval.
-// This matches Node's `fs.watchFile` semantics and is a reasonable approximation
-// of `fs.watch` for code that just needs to be notified.
+// ---- watch / watchFile / unwatchFile ----
 
 type WatchListener = (event: 'rename' | 'change', filename: string | null) => void;
+type HostMutation = { type: 'write' | 'mkdir' | 'rename' | 'rm'; path: string; previousPath?: string };
+type DuskLifecycle = { retain(): () => void };
+
+const lifecycle = (): DuskLifecycle | undefined =>
+  ((globalThis as Record<string, unknown>)['__process'] as { __duskLifecycle?: DuskLifecycle } | undefined)?.__duskLifecycle;
 
 interface WatchOptions {
   persistent?: boolean;
@@ -560,28 +615,46 @@ class FSWatcher {
   private _listeners: Map<string, Set<Function>> = new Map();
   private _closed = false;
   private _timer: ReturnType<typeof setInterval> | null = null;
-  // Snapshot: path → (mtime, size, isDir, dirEntries set)
-  private _snapshot: Map<string, { mtime: number; size: number; isDir: boolean; entries?: Set<string> }> = new Map();
+  private _hostSubscription: number | null = null;
+  private _releaseLifecycle: (() => void) | null = null;
+  private _pendingHostEvents = new Map<string, 'rename' | 'change'>();
+  private _hostEventsQueued = false;
+  // Snapshot signatures avoid unstable synthetic stat timestamps.
+  private _snapshot: Map<string, { signature: string; isDir: boolean; entries?: Set<string> }> = new Map();
 
   constructor(p: string, opts: WatchOptions = {}) {
-    this._path = p;
+    this._path = normalizePath(p);
     this._interval = opts.interval ?? 1000;
     this._recursive = !!opts.recursive;
     this._buildSnapshot(this._path);
-    this._timer = setInterval(() => this._poll(), this._interval) as unknown as ReturnType<typeof setInterval>;
+    try {
+      const id = call('fs.watch.subscribe') as number;
+      if (typeof id === 'number') {
+        this._hostSubscription = id;
+        hostWatchers.set(id, this);
+      }
+    } catch { /* Older hosts use the polling fallback. */ }
+    if (this._hostSubscription === null) {
+      this._timer = setInterval(() => this._poll(), this._interval) as unknown as ReturnType<typeof setInterval>;
+    } else {
+      // Host subscriptions need no polling, but a persistent FSWatcher still
+      // keeps the guest alive until close() or unref().
+      this._timer = setInterval(() => {}, 0x7fffffff) as unknown as ReturnType<typeof setInterval>;
+    }
+    // The watcher, not its polling implementation, owns process retention.
+    (this._timer as unknown as { unref?: () => void } | null)?.unref?.();
+    if (opts.persistent !== false) this._retainLifecycle();
   }
 
   private _buildSnapshot(p: string): void {
     try {
       const st = statSync(p);
-      const entry: { mtime: number; size: number; isDir: boolean; entries?: Set<string> } = {
-        mtime: st.mtimeMs,
-        size: st.size,
-        isDir: st.isDirectory(),
+      const entry: { signature: string; isDir: boolean; entries?: Set<string> } = {
+        signature: this._statSignature(p, st), isDir: st.isDirectory(),
       };
       if (entry.isDir) {
         try {
-          entry.entries = new Set(readdirSync(p));
+          entry.entries = new Set(readdirSync(p) as string[]);
           if (this._recursive) {
             for (const child of entry.entries) {
               this._buildSnapshot(p + '/' + child);
@@ -591,6 +664,16 @@ class FSWatcher {
       }
       this._snapshot.set(p, entry);
     } catch { /* path may not exist yet */ }
+  }
+
+  private _statSignature(path: string, st: Stats): string {
+    return `${path}\0${st.mtimeKnown ? st.mtimeMs : ''}\0${st.size}\0${st.isDirectory() ? 1 : 0}`;
+  }
+
+  private _deleteSnapshotSubtree(path: string): void {
+    for (const key of this._snapshot.keys()) {
+      if (key === path || key.startsWith(path + '/')) this._snapshot.delete(key);
+    }
   }
 
   private _emit(event: 'rename' | 'change' | 'close', filename: string | null): void {
@@ -620,40 +703,26 @@ class FSWatcher {
     const prev = this._snapshot.get(p);
     if (!st) {
       if (prev) {
-        this._snapshot.delete(p);
+        this._deleteSnapshotSubtree(p);
         this._emit('rename', this._relativeName(p));
       }
       return;
     }
     if (!prev) {
-      // New
-      const entry: { mtime: number; size: number; isDir: boolean; entries?: Set<string> } = {
-        mtime: st.mtimeMs,
-        size: st.size,
-        isDir: st.isDirectory(),
-      };
-      if (entry.isDir) {
-        try { entry.entries = new Set(readdirSync(p)); } catch { /* */ }
-      }
-      this._snapshot.set(p, entry);
+      this._buildSnapshot(p);
       this._emit('rename', this._relativeName(p));
-      if (this._recursive && entry.entries) {
-        for (const child of entry.entries) {
-          this._diffSubtree(p + '/' + child);
-        }
-      }
       return;
     }
     // Check for changes to this entry
-    if (prev.mtime !== st.mtimeMs || prev.size !== st.size) {
-      prev.mtime = st.mtimeMs;
-      prev.size = st.size;
+    const signature = this._statSignature(p, st);
+    if (prev.signature !== signature) {
+      prev.signature = signature;
       this._emit('change', this._relativeName(p));
     }
     // For directories, compare entry sets
     if (st.isDirectory()) {
       let current: Set<string>;
-      try { current = new Set(readdirSync(p)); }
+      try { current = new Set(readdirSync(p) as string[]); }
       catch { return; }
       const prevSet = prev.entries ?? new Set<string>();
       // Detect additions/removals
@@ -661,14 +730,14 @@ class FSWatcher {
         if (!prevSet.has(name)) {
           this._emit('rename', name);
           if (this._recursive) {
-            this._diffSubtree(p + '/' + name);
+            this._buildSnapshot(p + '/' + name);
           }
         }
       }
       for (const name of prevSet) {
         if (!current.has(name)) {
           this._emit('rename', name);
-          this._snapshot.delete(p + '/' + name);
+          this._deleteSnapshotSubtree(p + '/' + name);
         }
       }
       prev.entries = current;
@@ -684,6 +753,33 @@ class FSWatcher {
     if (p === this._path) return p.split('/').pop() ?? p;
     if (p.startsWith(this._path + '/')) return p.slice(this._path.length + 1);
     return p;
+  }
+
+  _onHostMutation(mutation: HostMutation): void {
+    if (this._closed) return;
+    const watchedPath = this._path;
+    const watchesPath = (path: string | undefined): path is string => path === watchedPath
+      || !!path && path.startsWith(watchedPath + '/')
+        && (this._recursive || !path.slice(watchedPath.length + 1).includes('/'));
+    const affectedPath = watchesPath(mutation.path)
+      ? mutation.path
+      : watchesPath(mutation.previousPath)
+        ? mutation.previousPath
+        : undefined;
+    if (!affectedPath) return;
+    const event = mutation.type === 'write' ? 'change' : 'rename';
+    const filename = this._relativeName(affectedPath);
+    const prior = this._pendingHostEvents.get(filename);
+    if (prior !== 'rename') this._pendingHostEvents.set(filename, event);
+    if (this._hostEventsQueued) return;
+    this._hostEventsQueued = true;
+    defer(() => {
+      this._hostEventsQueued = false;
+      if (this._closed) return;
+      const events = this._pendingHostEvents;
+      this._pendingHostEvents = new Map();
+      for (const [name, queuedEvent] of events) this._emit(queuedEvent, name);
+    });
   }
 
   on(event: string, listener: Function): this {
@@ -703,18 +799,44 @@ class FSWatcher {
   close(): void {
     if (this._closed) return;
     this._closed = true;
+    if (this._hostSubscription !== null) {
+      hostWatchers.delete(this._hostSubscription);
+      try { call('fs.watch.unsubscribe', { id: this._hostSubscription }); } catch { /* Host may already be gone. */ }
+      this._hostSubscription = null;
+    }
     if (this._timer) {
       clearInterval(this._timer);
       this._timer = null;
     }
+    this._pendingHostEvents.clear();
+    this._emit('close', null);
+    this._releaseLifecycle?.();
+    this._releaseLifecycle = null;
     this._listeners.clear();
     this._snapshot.clear();
-    this._emit('close', null);
   }
 
-  ref(): this { return this; }
-  unref(): this { return this; }
+  ref(): this {
+    this._retainLifecycle();
+    return this;
+  }
+  unref(): this {
+    this._releaseLifecycle?.();
+    this._releaseLifecycle = null;
+    return this;
+  }
+
+  private _retainLifecycle(): void {
+    if (!this._releaseLifecycle) this._releaseLifecycle = lifecycle()?.retain() ?? null;
+  }
 }
+
+const hostWatchers = new Map<number, FSWatcher>();
+(globalThis as Record<string, unknown>)['__fsWatch'] = {
+  dispatch(id: number, mutation: HostMutation): void {
+    hostWatchers.get(id)?._onHostMutation(mutation);
+  },
+};
 
 const watch = (
   filename: string,
@@ -726,7 +848,7 @@ const watch = (
   if (typeof optsOrListener === 'function') listener = optsOrListener;
   else if (optsOrListener && typeof optsOrListener === 'object') opts = optsOrListener;
   if (maybeListener) listener = maybeListener;
-  const w = new FSWatcher(filename, opts);
+  const w = new FSWatcher(normalizePath(filename), opts);
   if (listener) w.on('change', listener as Function).on('rename', listener as Function);
   return w;
 };
@@ -748,26 +870,27 @@ const watchFile = (
   optsOrListener: { interval?: number; persistent?: boolean } | ((curr: Stats, prev: Stats) => void),
   maybeListener?: (curr: Stats, prev: Stats) => void,
 ): void => {
+  const filePath = normalizePath(filename);
   const opts = (typeof optsOrListener === 'object' ? optsOrListener : {}) as { interval?: number };
   const listener = (typeof optsOrListener === 'function' ? optsOrListener : maybeListener) as
     | ((curr: Stats, prev: Stats) => void)
     | undefined;
   if (!listener) return;
   const interval = opts.interval ?? 5007;
-  let entry = _fileWatchers.get(filename);
+  let entry = _fileWatchers.get(filePath);
   if (!entry) {
     let initial: Stats | null = null;
-    try { initial = statSync(filename); } catch { /* */ }
+    try { initial = statSync(filePath); } catch { /* */ }
     entry = {
       curr: initial,
       prev: initial,
       listeners: new Set(),
       interval,
       timer: setInterval(() => {
-        const e = _fileWatchers.get(filename);
+        const e = _fileWatchers.get(filePath);
         if (!e) return;
         let next: Stats | null = null;
-        try { next = statSync(filename); } catch { /* */ }
+        try { next = statSync(filePath); } catch { /* */ }
         if (next && e.curr) {
           if (next.mtimeMs !== e.curr.mtimeMs || next.size !== e.curr.size) {
             e.prev = e.curr;
@@ -785,13 +908,14 @@ const watchFile = (
         }
       }, interval) as unknown as ReturnType<typeof setInterval>,
     };
-    _fileWatchers.set(filename, entry);
+    _fileWatchers.set(filePath, entry);
   }
   entry.listeners.add(listener);
 };
 
 const unwatchFile = (filename: string, listener?: (curr: Stats, prev: Stats) => void): void => {
-  const entry = _fileWatchers.get(filename);
+  const filePath = normalizePath(filename);
+  const entry = _fileWatchers.get(filePath);
   if (!entry) return;
   if (listener) {
     entry.listeners.delete(listener);
@@ -800,7 +924,7 @@ const unwatchFile = (filename: string, listener?: (curr: Stats, prev: Stats) => 
   }
   if (entry.listeners.size === 0) {
     clearInterval(entry.timer);
-    _fileWatchers.delete(filename);
+    _fileWatchers.delete(filePath);
   }
 };
 
@@ -816,6 +940,7 @@ export interface CreateReadStreamOptions {
 }
 
 export const createReadStream = (path: string, opts?: CreateReadStreamOptions | string): Readable => {
+  const filePath = normalizePath(path);
   const o: CreateReadStreamOptions = typeof opts === 'string' ? { encoding: opts } : (opts ?? {});
   let pushed = false;
   return new Readable({
@@ -825,7 +950,7 @@ export const createReadStream = (path: string, opts?: CreateReadStreamOptions | 
       pushed = true;
       defer(() => {
         try {
-          const arr = call('fs.readFileBytes', { path }) as number[];
+          const arr = call('fs.readFileBytes', { path: filePath }) as number[];
           const buf = Uint8Array.from(arr);
           const start = o.start ?? 0;
           const end = o.end !== undefined ? Math.min(o.end + 1, buf.length) : buf.length;
@@ -852,6 +977,7 @@ export interface CreateWriteStreamOptions {
 }
 
 export const createWriteStream = (path: string, opts?: CreateWriteStreamOptions | string): Writable => {
+  const filePath = normalizePath(path);
   const o: CreateWriteStreamOptions = typeof opts === 'string' ? { encoding: opts } : (opts ?? {});
   const chunks: Uint8Array[] = [];
   const isAppend = o.flags === 'a' || o.flags === 'a+';
@@ -872,14 +998,14 @@ export const createWriteStream = (path: string, opts?: CreateWriteStreamOptions 
           let finalBytes = combined;
           if (isAppend) {
             try {
-              const existing = Uint8Array.from(call('fs.readFileBytes', { path }) as number[]);
+              const existing = Uint8Array.from(call('fs.readFileBytes', { path: filePath }) as number[]);
               const merged = new Uint8Array(existing.length + combined.length);
               merged.set(existing, 0);
               merged.set(combined, existing.length);
               finalBytes = merged;
             } catch { /* */ }
           }
-          call('fs.writeFileBytes', { path, data: Array.from(finalBytes) });
+          call('fs.writeFileBytes', { path: filePath, data: Array.from(finalBytes) });
           cb();
         } catch (e) { cb(e as Error); }
       });
@@ -890,10 +1016,11 @@ export const createWriteStream = (path: string, opts?: CreateWriteStreamOptions 
 // ---- mkdtemp ----
 
 const mkdtempSync = (prefix: string): string => {
+  const path = normalizePath(prefix);
   const suffix = Math.random().toString(36).slice(2, 8);
-  const path = prefix + suffix;
-  call('fs.mkdir', { path, recursive: false });
-  return path;
+  const directory = path + suffix;
+  call('fs.mkdir', { path: directory, recursive: false });
+  return directory;
 };
 
 const mkdtemp = (prefix: string, optsOrCb?: unknown, maybeCb?: Cb): void => {
@@ -914,7 +1041,7 @@ const promises = {
   readFile: (path: string, opts?: string | { encoding?: string | null }): Promise<unknown> =>
     promiseOp(() => {
       if (opts === undefined) {
-        const arr = call('fs.readFileBytes', { path }) as number[];
+        const arr = call('fs.readFileBytes', { path: normalizePath(path) }) as number[];
         return toBuffer(Uint8Array.from(arr));
       }
       return readFileSync(path, opts as string | { encoding?: string });
@@ -923,15 +1050,15 @@ const promises = {
     promiseOp(() => {
       if (typeof data !== 'string' && (data instanceof Uint8Array || Array.isArray(data))) {
         const bytes = data instanceof Uint8Array ? data : Uint8Array.from(data as number[]);
-        call('fs.writeFileBytes', { path, data: Array.from(bytes) });
+        call('fs.writeFileBytes', { path: normalizePath(path), data: Array.from(bytes) });
         return;
       }
       writeFileSync(path, data);
     }),
   appendFile: (path: string, data: unknown): Promise<void> =>
     promiseOp(() => appendFileSync(path, data)),
-  readdir: (path: string): Promise<string[]> =>
-    promiseOp(() => readdirSync(path)),
+  readdir: (path: string, opts?: { withFileTypes?: boolean }): Promise<string[] | Dirent[]> =>
+    promiseOp(() => readdirSync(path, opts)),
   mkdir: (path: string, opts?: { recursive?: boolean }): Promise<void> =>
     promiseOp(() => mkdirSync(path, opts)),
   rm: (path: string, opts?: { recursive?: boolean; force?: boolean }): Promise<void> =>
@@ -1074,7 +1201,7 @@ export const nodeFs = {
   renameSync,
   copyFileSync,
   accessSync,
-  realpathSync,
+  realpathSync: Object.assign(realpathSync, { native: realpathSync }),
   truncateSync,
   chmodSync, fchmodSync, lchmodSync,
   chownSync, fchownSync, lchownSync,

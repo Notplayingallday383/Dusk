@@ -4,6 +4,11 @@ import { installRequire } from './require';
 import { installESM } from './esm';
 import { installNet } from './net';
 
+{
+  const g = globalThis as Record<string, unknown>;
+  if (typeof g['global'] === 'undefined') g['global'] = globalThis;
+}
+
 // Timer polyfills for the SpiderMonkey shell. The shell provides a synchronous
 // `setTimeout` (fires during drainJobQueue with no real delay) but nothing
 // else in the timer family. Third-party libraries (just-bash, sprintf-js
@@ -94,7 +99,10 @@ import { installNet } from './net';
   // sha256sum, uuid packages, etc.) can call the standard WebCrypto API.
   // Routes through the host's crypto.digest / crypto.random funcs.
   const gc = g['crypto'] as Record<string, unknown> | undefined;
-  if (!gc || typeof (gc['subtle'] as Record<string, unknown> | undefined)?.['digest'] !== 'function') {
+  if (!gc ||
+    typeof (gc['subtle'] as Record<string, unknown> | undefined)?.['digest'] !== 'function' ||
+    typeof gc['getRandomValues'] !== 'function' ||
+    typeof gc['randomUUID'] !== 'function') {
     const cryptoCall = (fname: string, extra: Record<string, unknown>): unknown => {
       const ipc2 = (globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string } } }).ipc;
       if (!ipc2) throw new Error('crypto: ipc not available');
@@ -136,11 +144,24 @@ import { installNet } from './net';
         return Uint8Array.from(result).buffer;
       },
     };
+    const isIntegerTypedArray = (value: unknown): value is Int8Array | Uint8Array | Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array =>
+      value instanceof Int8Array ||
+      value instanceof Uint8Array ||
+      value instanceof Uint8ClampedArray ||
+      value instanceof Int16Array ||
+      value instanceof Uint16Array ||
+      value instanceof Int32Array ||
+      value instanceof Uint32Array;
     const cryptoShim = {
       subtle,
-      getRandomValues<T extends ArrayBufferView | null>(buf: T): T {
-        if (!buf) return buf;
-        const view = buf as unknown as ArrayBufferView;
+      getRandomValues<T extends ArrayBufferView>(buf: T): T {
+        if (!isIntegerTypedArray(buf)) throw new TypeError('crypto.getRandomValues expects an integer typed array');
+        if (buf.byteLength > 65_536) {
+          const error = new Error('The requested length exceeds 65,536 bytes');
+          error.name = 'QuotaExceededError';
+          throw error;
+        }
+        const view = buf as ArrayBufferView;
         const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
         const rand = cryptoCall('crypto.random', { size: bytes.length }) as number[];
         for (let i = 0; i < bytes.length && i < rand.length; i++) bytes[i] = rand[i]!;
@@ -237,7 +258,17 @@ import { installNet } from './net';
   }
 }
 
+const isNativeWorker = (globalThis as Record<string, unknown>)['__DUSK_NATIVE_WORKER__'] === true;
+
 if (typeof (globalThis as { ipc?: unknown }).ipc === 'undefined') {
+  if (isNativeWorker) {
+    (globalThis as Record<string, unknown>).ipc = {
+      send: (msg: unknown) => {
+        print(JSON.stringify(msg));
+        return JSON.parse(os.file.readFile('/comm'));
+      },
+    };
+  } else {
   (globalThis as Record<string, unknown>).evalQueue = [];
   (globalThis as Record<string, unknown>).ipc = {
     send: (msg: unknown, ignoreEval = true) => {
@@ -260,33 +291,173 @@ if (typeof (globalThis as { ipc?: unknown }).ipc === 'undefined') {
       }
     },
   };
+  }
 }
 
 declare const drainJobQueue: (() => void) | undefined;
 
 const ipc = (globalThis as { ipc: { send: (m: unknown, i?: boolean) => { js?: string } } }).ipc;
 
-installNodeGlobals();
-installRequire();
-installESM();
-installNet();
+const worldGlobal = globalThis as Record<string, unknown>;
+// Preserve the Worker task scheduler before the Node timer shim replaces it
+// with host-backed timers. Native evals must yield to browser tasks.
+const scheduleNativeTask = isNativeWorker ? globalThis.setTimeout.bind(globalThis) : undefined;
 
-if (!(globalThis as Record<string, unknown>)['__process']) {
-  (globalThis as Record<string, unknown>)['__process'] = {
+if (!worldGlobal['__process']) {
+  worldGlobal['__process'] = {
     _exitCode: undefined as number | undefined,
     dispatch: (_pid: number, _event: string, _data: unknown) => {
     },
   };
 }
 
-while (true) {
-  const reply = ipc.send({ type: 'wait' }, false);
-  const js = (reply.js ?? '').replace(/\bimport\s*\(/g, '__import__(');
-  try { (0, eval)('(async () => {' + js + '\n})()'); if (typeof drainJobQueue === 'function') drainJobQueue(); } catch (e) { print(JSON.stringify({ f: 'console.error', args: [String(e)] })); }
-  const proc = (globalThis as Record<string, unknown>)['__process'] as { _exitCode?: number } | undefined;
-  if (proc?._exitCode !== undefined) {
-    ipc.send({ type: 'exit', exitCode: proc._exitCode });
-    break;
+interface DuskLifecycle {
+  retain(): () => void;
+  whenIdle(): Promise<void>;
+}
+
+const processRecord = worldGlobal['__process'] as Record<string, unknown>;
+if (isNativeWorker && !processRecord['__duskLifecycle']) {
+  let count = 0;
+  let idle = Promise.resolve();
+  let resolveIdle: (() => void) | undefined;
+  const lifecycle: DuskLifecycle = {
+    retain: (): (() => void) => {
+      if (count++ === 0) idle = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      let released = false;
+      return (): void => {
+        if (released) return;
+        released = true;
+        if (--count === 0) {
+          resolveIdle?.();
+          resolveIdle = undefined;
+        }
+      };
+    },
+    whenIdle: (): Promise<void> => idle,
+  };
+  processRecord['__duskLifecycle'] = lifecycle;
+}
+
+if (isNativeWorker) {
+  type TimerRecord = { callback: Function; args: unknown[]; interval: number | null; refed: boolean; release: (() => void) | undefined };
+  interface TimerHandle {
+    ref(): TimerHandle;
+    unref(): TimerHandle;
+    hasRef(): boolean;
+    valueOf(): number;
   }
-  ipc.send({ type: 'done' });
+  const timers = new Map<number, TimerRecord>();
+  let nextTimerId = 1;
+  const schedule = (id: number, delay: number): void => { ipc.send({ f: 'timer.schedule', id, delay }); };
+  const cancel = (id: number): void => { ipc.send({ f: 'timer.cancel', id }); };
+  const timerId = (value: unknown): number => typeof value === 'number' ? value : Number(value);
+  const updateLifetime = (timer: TimerRecord): void => {
+    const lifecycle = ((globalThis as Record<string, unknown>)['__process'] as { __duskLifecycle?: DuskLifecycle } | undefined)?.__duskLifecycle;
+    if (timer.refed && !timer.release) timer.release = lifecycle?.retain();
+    if (!timer.refed && timer.release) {
+      timer.release();
+      timer.release = undefined;
+    }
+  };
+  const create = (callback: Function, delay: number | undefined, args: unknown[], interval: number | null): TimerHandle => {
+    const id = nextTimerId++;
+    const record: TimerRecord = { callback, args, interval, refed: true, release: undefined };
+    timers.set(id, record);
+    updateLifetime(record);
+    schedule(id, delay ?? 0);
+    const handle: TimerHandle = {
+      ref: (): TimerHandle => { record.refed = true; updateLifetime(record); return handle; },
+      unref: (): TimerHandle => { record.refed = false; updateLifetime(record); return handle; },
+      hasRef: (): boolean => record.refed,
+      valueOf: (): number => id,
+    };
+    return handle;
+  };
+  const g = globalThis as Record<string, unknown>;
+  g['setTimeout'] = (callback: Function, delay?: number, ...args: unknown[]): TimerHandle => create(callback, delay, args, null);
+  g['setInterval'] = (callback: Function, delay?: number, ...args: unknown[]): TimerHandle => create(callback, delay, args, delay ?? 0);
+  g['clearTimeout'] = (value: unknown): void => {
+    const id = timerId(value);
+    const timer = timers.get(id);
+    timers.delete(id);
+    timer?.release?.();
+    if (timer) timer.release = undefined;
+    cancel(id);
+  };
+  g['clearInterval'] = g['clearTimeout'];
+  g['setImmediate'] = (callback: Function, ...args: unknown[]): TimerHandle => create(callback, 0, args, null);
+  g['clearImmediate'] = g['clearTimeout'];
+  g['__duskTimers'] = {
+    fire(id: number): void {
+      const timer = timers.get(id);
+      if (!timer) return;
+      if (timer.interval === null) timers.delete(id);
+      try { timer.callback(...timer.args); } catch (error) { print(JSON.stringify({ f: 'console.error', args: [String(error)] })); }
+      if (timer.interval !== null && timers.has(id)) schedule(id, timer.interval);
+      if (timer.interval === null && timer.release) {
+        timer.release();
+        timer.release = undefined;
+      }
+    },
+  };
+}
+
+installNodeGlobals();
+installRequire();
+installESM();
+installNet();
+
+if (isNativeWorker) {
+  const evalQueue: Array<{ js: string; primary: boolean }> = [];
+  let scheduled = false;
+  let exited = false;
+
+  const execute = async ({ js, primary }: { js: string; primary: boolean }): Promise<void> => {
+    try {
+      await (0, eval)('(async () => {' + js.replace(/\bimport\s*\(/g, '__import__(') + '\n})()');
+    } catch (e) {
+      print(JSON.stringify({ f: 'console.error', args: [String(e)] }));
+    }
+    const proc = worldGlobal['__process'] as { _exitCode?: number } | undefined;
+    if (proc?._exitCode !== undefined) {
+      if (!exited) {
+        exited = true;
+        ipc.send({ type: 'exit', exitCode: proc._exitCode });
+      }
+      return;
+    }
+    ipc.send({ type: 'done', primary });
+  };
+
+  const drain = (): void => {
+    scheduled = false;
+    const entry = evalQueue.shift();
+    if (!entry || exited) return;
+    // Start one evaluation per Worker task so host events and Promise jobs
+    // can interleave with a primary async continuation.
+    void execute(entry);
+    if (evalQueue.length > 0) schedule();
+  };
+  const schedule = (): void => {
+    if (scheduled || exited) return;
+    scheduled = true;
+    scheduleNativeTask!(drain, 0);
+  };
+  worldGlobal['__duskEnqueueEval'] = (js: string, primary: boolean): void => {
+    evalQueue.push({ js, primary });
+    schedule();
+  };
+} else {
+  while (true) {
+    const reply = ipc.send({ type: 'wait' }, false);
+    const js = (reply.js ?? '').replace(/\bimport\s*\(/g, '__import__(');
+    try { (0, eval)('(async () => {' + js + '\n})()'); if (typeof drainJobQueue === 'function') drainJobQueue(); } catch (e) { print(JSON.stringify({ f: 'console.error', args: [String(e)] })); }
+    const proc = (globalThis as Record<string, unknown>)['__process'] as { _exitCode?: number } | undefined;
+    if (proc?._exitCode !== undefined) {
+      ipc.send({ type: 'exit', exitCode: proc._exitCode });
+      break;
+    }
+    ipc.send({ type: 'done' });
+  }
 }

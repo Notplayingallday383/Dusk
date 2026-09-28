@@ -10,7 +10,7 @@
 //   readdirWithFileTypes (readdir+stat), cp recursive (walk+write),
 //   lstat (= stat; TFS has no symlinks), realpath (= resolvePath; ditto),
 //   getAllPaths (walk from /, capped).
-// - No-op: chmod, utimes (TFS has no permissions or mtimes yet).
+// - No-op: chmod, utimes (TFS has no permissions and manages mtimes internally).
 // - ENOTSUP: symlink, link, readlink.
 //
 // The strategy prefers "silently degrade" over "hard fail" because typical
@@ -28,7 +28,7 @@ type FsGlobal = {
   mkdir: (path: string, recursive: boolean) => void;
   rm: (path: string, recursive?: boolean) => void;
   exists: (path: string) => boolean;
-  stat: (path: string) => { isFile: boolean; isDirectory: boolean; size?: number };
+  stat: (path: string) => { isFile: boolean; isDirectory: boolean; size: number; mtimeMs: number };
   rename: (from: string, to: string) => void;
   appendFile: (path: string, data: string) => void;
 };
@@ -104,6 +104,9 @@ export class TfsFs {
   writeFileSync(path: string, content: string | Uint8Array): void {
     try {
       this.ensureParent(path);
+      // Command registration creates generated /bin and /usr/bin stubs. Keep
+      // an existing package-manager shim at either path intact.
+      if (typeof content === 'string' && content.startsWith('#!/bin/bash\n# Built-in command:') && this.fs().exists(path)) return;
       this.fs().writeFile(path, normalizeContent(content));
     } catch { /* ignore, best-effort */ }
   }
@@ -140,15 +143,16 @@ export class TfsFs {
     // this, `npm`, `npx`, `dpm`, etc. resolve to file-exists but not
     // executable → "command not found".
     const isBinDir = path === '/bin' || path.startsWith('/bin/') ||
-                     path === '/usr/bin' || path.startsWith('/usr/bin/');
+                      path === '/usr/bin' || path.startsWith('/usr/bin/') ||
+                      /\/node_modules\/\.bin\/[^/]+$/.test(path);
     const mode = s.isDirectory ? 0o755 : (isBinDir ? 0o755 : 0o644);
     return {
       isFile: !!s.isFile,
       isDirectory: !!s.isDirectory,
       isSymbolicLink: false,
       mode,
-      size: s.size ?? 0,
-      mtime: new Date(0),
+      size: s.size,
+      mtime: new Date(s.mtimeMs),
     };
   }
 

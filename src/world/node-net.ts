@@ -17,7 +17,7 @@ const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
 };
 
 const socketsById = new Map<number, Socket>();
-const serversById = new Map<number, Server>();
+const serversById = new Map<number, { accept(socket: Socket): void; tlsClientError?(error: Error): void }>();
 
 interface NodeActiveHandles {
   count: number;
@@ -57,7 +57,13 @@ registerSocketDispatch((event: string, socketId: number, payload?: unknown): voi
     const sock = new Socket({ _existingId: clientSocketId, _existingRemote: 'incoming' });
     socketsById.set(clientSocketId, sock);
     sock._markConnected('incoming', 0);
-    srv.emit('connection', sock);
+    srv.accept(sock);
+    return;
+  }
+  if (event === 'tlsClientError') {
+    const srv = serversById.get(socketId);
+    if (!srv?.tlsClientError) return;
+    srv.tlsClientError(new Error(String(payload)));
     return;
   }
   const sock = socketsById.get(socketId);
@@ -228,7 +234,7 @@ export class Server extends EventEmitter {
       this._serverId = v.serverId;
       this._host = v.address;
       this._port = v.port;
-      serversById.set(this._serverId, this);
+      serversById.set(this._serverId, { accept: (socket) => this.emit('connection', socket) });
       this.listening = true;
       if (this._refed && !this._activeHandle) {
         this._activeHandle = true;
@@ -301,6 +307,14 @@ export const createConnection = (
 };
 
 export const connect = createConnection;
+
+export const registerIncomingServer = (serverId: number, accept: (socket: Socket) => void, tlsClientError?: (error: Error) => void): void => {
+  serversById.set(serverId, tlsClientError ? { accept, tlsClientError } : { accept });
+};
+
+export const unregisterIncomingServer = (serverId: number): void => {
+  serversById.delete(serverId);
+};
 
 export const isIP = (s: string): number => {
   if (/^(\d{1,3}\.){3}\d{1,3}$/.test(s)) {

@@ -1,6 +1,33 @@
 import { test, expect } from 'vitest';
 import { bootRepl } from '../src/index';
 
+test('node:crypto webcrypto retains the ambient Web Crypto identity', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed(
+    "const nodeCrypto = require('node:crypto'); const w = nodeCrypto.webcrypto; " +
+    "const values = new Uint8Array(8); w.getRandomValues(values); " +
+    "const rootValues = new Uint8Array(8); const rootWorks = nodeCrypto.getRandomValues(rootValues) === rootValues; " +
+    "let floatRejected = false; let quotaRejected = false; " +
+    "try { nodeCrypto.getRandomValues(new Float32Array(1)); } catch (error) { floatRejected = error instanceof TypeError; } " +
+    "try { nodeCrypto.getRandomValues(new Uint8Array(65537)); } catch (error) { quotaRejected = error.name === 'QuotaExceededError'; } " +
+    "process.stdout.write('identity=' + (w === globalThis.crypto) + '|rootWorks=' + rootWorks + '|uuid=' + /^[0-9a-f-]{36}$/.test(w.randomUUID()) + '|floatRejected=' + floatRejected + '|quotaRejected=' + quotaRejected + '\\n')"
+  );
+  repl.engine.terminate();
+
+  expect(out.join('')).toContain('identity=true|rootWorks=true|uuid=true|floatRejected=true|quotaRejected=true');
+}, 60_000);
+
+test('persisted node:crypto declaration remains the Dusk builtin on a later REPL feed', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed("const crypto = require('node:crypto')");
+  await repl.feed("process.stdout.write('HASH=' + crypto.createHash('sha256').update('hello').digest('hex') + '\\n')");
+  repl.engine.terminate();
+
+  expect(out.join('')).toContain('HASH=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
+}, 60_000);
+
 test('node:crypto randomBytes, sha256(hello), hmac sha1, timingSafeEqual, randomUUID', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });

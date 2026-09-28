@@ -6,6 +6,7 @@ interface InternalListener {
 }
 
 const kCapture = Symbol('captureRejections');
+const kState = Symbol('events.state');
 
 interface EmitterState {
   events: Map<string | symbol, InternalListener[]>;
@@ -27,16 +28,25 @@ const ensureFn = (v: unknown, name: string): Listener => {
 let defaultMaxListeners = 10;
 
 export class EventEmitter {
-  private _state: EmitterState;
+  static EventEmitter = EventEmitter;
+  private [kState]?: EmitterState;
   static defaultMaxListeners = 10;
   static readonly captureRejectionSymbol = kCapture;
   static readonly errorMonitor = Symbol('events.errorMonitor');
 
   constructor(opts?: { captureRejections?: boolean }) {
-    this._state = {
+    this[kState] = {
       events: new Map(),
       maxListeners: defaultMaxListeners,
       captureRejections: opts?.captureRejections ?? false,
+    };
+  }
+
+  private _getState(): EmitterState {
+    return this[kState] ??= {
+      events: new Map(),
+      maxListeners: defaultMaxListeners,
+      captureRejections: false,
     };
   }
 
@@ -46,18 +56,19 @@ export class EventEmitter {
       (err as unknown as Record<string, unknown>)['code'] = 'ERR_OUT_OF_RANGE';
       throw err;
     }
-    this._state.maxListeners = n;
+    this._getState().maxListeners = n;
     return this;
   }
 
   getMaxListeners(): number {
-    return this._state.maxListeners;
+    return this._getState().maxListeners;
   }
 
   emit(event: string | symbol, ...args: unknown[]): boolean {
-    const listeners = this._state.events.get(event);
+    const state = this._getState();
+    const listeners = state.events.get(event);
     if (event === 'error') {
-      const errMonitorListeners = this._state.events.get(EventEmitter.errorMonitor);
+      const errMonitorListeners = state.events.get(EventEmitter.errorMonitor);
       if (errMonitorListeners) {
         for (const l of errMonitorListeners.slice()) {
           try { l.fn.apply(this, args); } catch { /* */ }
@@ -79,7 +90,7 @@ export class EventEmitter {
       if (l.once) this._removeOne(event, l);
       try {
         const r = l.fn.apply(this, args);
-        if (this._state.captureRejections && r && typeof (r as Promise<unknown>).then === 'function') {
+        if (state.captureRejections && r && typeof (r as Promise<unknown>).then === 'function') {
           (r as Promise<unknown>).then(undefined, (err: unknown) => {
             if (event === 'error') {
               try { this.emit('error', err); } catch { /* */ }
@@ -114,16 +125,17 @@ export class EventEmitter {
 
   private _add(event: string | symbol, listener: unknown, once: boolean, prepend: boolean): this {
     const fn = ensureFn(listener, 'listener');
-    let arr = this._state.events.get(event);
+    const state = this._getState();
+    let arr = state.events.get(event);
     if (!arr) {
       arr = [];
-      this._state.events.set(event, arr);
+      state.events.set(event, arr);
     }
     this.emit('newListener', event, fn);
     const wrapped: InternalListener = { fn, once };
     if (prepend) arr.unshift(wrapped);
     else arr.push(wrapped);
-    if (this._state.maxListeners > 0 && arr.length > this._state.maxListeners) {
+    if (state.maxListeners > 0 && arr.length > state.maxListeners) {
       // best-effort warning via console
       const g = globalThis as Record<string, unknown>;
       const c = g['console'] as { error?: (...a: unknown[]) => void } | undefined;
@@ -134,7 +146,8 @@ export class EventEmitter {
 
   removeListener(event: string | symbol, listener: Listener): this {
     ensureFn(listener, 'listener');
-    const arr = this._state.events.get(event);
+    const state = this._getState();
+    const arr = state.events.get(event);
     if (!arr) return this;
     for (let i = arr.length - 1; i >= 0; i--) {
       const cur = arr[i];
@@ -144,7 +157,7 @@ export class EventEmitter {
         break;
       }
     }
-    if (arr.length === 0) this._state.events.delete(event);
+    if (arr.length === 0) state.events.delete(event);
     return this;
   }
   off(event: string | symbol, listener: Listener): this {
@@ -152,24 +165,25 @@ export class EventEmitter {
   }
 
   private _removeOne(event: string | symbol, target: InternalListener): void {
-    const arr = this._state.events.get(event);
+    const state = this._getState();
+    const arr = state.events.get(event);
     if (!arr) return;
     const idx = arr.indexOf(target);
     if (idx >= 0) arr.splice(idx, 1);
-    if (arr.length === 0) this._state.events.delete(event);
+    if (arr.length === 0) state.events.delete(event);
   }
 
   removeAllListeners(event?: string | symbol): this {
     if (event === undefined) {
-      this._state.events.clear();
+      this._getState().events.clear();
       return this;
     }
-    this._state.events.delete(event);
+    this._getState().events.delete(event);
     return this;
   }
 
   listeners(event: string | symbol): Listener[] {
-    const arr = this._state.events.get(event);
+    const arr = this._getState().events.get(event);
     if (!arr) return [];
     return arr.map((l) => l.fn);
   }
@@ -179,11 +193,11 @@ export class EventEmitter {
   }
 
   listenerCount(event: string | symbol): number {
-    return this._state.events.get(event)?.length ?? 0;
+    return this._getState().events.get(event)?.length ?? 0;
   }
 
   eventNames(): (string | symbol)[] {
-    return [...this._state.events.keys()];
+    return [...this._getState().events.keys()];
   }
 }
 

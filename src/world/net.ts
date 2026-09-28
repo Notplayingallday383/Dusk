@@ -11,6 +11,28 @@ const call = (f: string, extra: Record<string, unknown>): unknown => {
 export const installNet = (): void => {
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   const wsHandlers = new Map<number, Record<string, ((d: unknown) => void)[]>>();
+  const responseFrom = (raw: unknown): {
+    status: number;
+    statusText: string;
+    headers: Map<string, string>;
+    ok: boolean;
+    text: () => Promise<string>;
+    json: () => Promise<unknown>;
+    arrayBuffer: () => Promise<ArrayBuffer>;
+  } => {
+    const r = raw as { status: number; statusText: string; headers: [string, string][]; body: number[] };
+    const bytes = Uint8Array.from(r.body);
+    const text = (): string => new TextDecoder().decode(bytes);
+    return {
+      status: r.status,
+      statusText: r.statusText,
+      headers: new Map(r.headers),
+      ok: r.status >= 200 && r.status < 300,
+      text: () => Promise.resolve(text()),
+      json: () => Promise.resolve(JSON.parse(text())),
+      arrayBuffer: () => Promise.resolve(bytes.slice().buffer),
+    };
+  };
 
   registerFetchDispatch((id: number, kind: string, payload: unknown): void => {
     const p = pending.get(id);
@@ -27,16 +49,7 @@ export const installNet = (): void => {
     const id = call('net.fetch', { url, opts }) as number;
     return new Promise((resolve, reject) => {
       pending.set(id, {
-        resolve: (raw) => {
-          const r = raw as { status: number; statusText: string; headers: [string, string][]; body: string };
-          resolve({
-            status: r.status,
-            statusText: r.statusText,
-            headers: new Map(r.headers),
-            text: () => Promise.resolve(r.body),
-            json: () => Promise.resolve(JSON.parse(r.body)),
-          });
-        },
+        resolve: (raw) => { resolve(responseFrom(raw)); },
         reject,
       });
     });
@@ -52,7 +65,7 @@ export const installNet = (): void => {
       this.id = call('net.ws.open', { url, protocols }) as number;
       wsHandlers.set(this.id, {
         open: [() => this.onopen?.()],
-        message: [(d) => this.onmessage?.({ data: d })],
+        message: [(d) => this.onmessage?.({ data: Array.isArray(d) ? Uint8Array.from(d) : d })],
         close: [() => this.onclose?.()],
         error: [(e) => this.onerror?.(e)],
       });
@@ -77,21 +90,23 @@ export const installNet = (): void => {
       this.method = method; this.url = url; this.async_ = async; this.readyState = 1;
     }
 
-    private apply(r: { status: number; statusText: string; body: string }): void {
-      this.status = r.status; this.statusText = r.statusText; this.responseText = r.body;
+    private apply(r: { status: number; statusText: string; body: number[] }): void {
+      this.status = r.status;
+      this.statusText = r.statusText;
+      this.responseText = new TextDecoder().decode(Uint8Array.from(r.body));
       this.readyState = 4; this.onreadystatechange?.(); this.onload?.();
     }
 
     send(body?: string): void {
       const opts = { method: this.method, body };
       if (!this.async_) {
-        const r = call('net.fetch.sync', { url: this.url, opts }) as { status: number; statusText: string; body: string };
+        const r = call('net.fetch.sync', { url: this.url, opts }) as { status: number; statusText: string; body: number[] };
         this.apply(r);
         return;
       }
       const id = call('net.fetch', { url: this.url, opts }) as number;
       pending.set(id, {
-        resolve: (raw) => this.apply(raw as { status: number; statusText: string; body: string }),
+        resolve: (raw) => this.apply(raw as { status: number; statusText: string; body: number[] }),
         reject: (e) => this.onerror?.(e),
       });
     }
@@ -116,8 +131,7 @@ export const installNet = (): void => {
       return new Promise((resolve, reject) => {
         pending.set(id, {
           resolve: (raw) => {
-            const r = raw as { status: number; statusText: string; headers: [string, string][]; body: string };
-            resolve({ status: r.status, statusText: r.statusText, headers: new Map(r.headers), text: () => Promise.resolve(r.body), json: () => Promise.resolve(JSON.parse(r.body)) });
+            resolve(responseFrom(raw));
           },
           reject,
         });

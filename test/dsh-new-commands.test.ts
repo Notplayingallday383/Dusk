@@ -11,6 +11,7 @@
 
 import { test, expect } from 'vitest';
 import { bootRepl } from '../src/index';
+import type { LibCurl } from '../src/host/net';
 
 const decode = (bytes: Uint8Array): string => {
   let s = '';
@@ -34,6 +35,39 @@ const dsh = async (
   }
 };
 
+const response = (status: number, statusText: string, body: number[], headers: [string, string][] = []): Response => ({
+  status,
+  statusText,
+  ok: status >= 200 && status < 300,
+  headers: { entries: () => headers[Symbol.iterator](), forEach: (fn: (value: string, key: string) => void) => headers.forEach(([key, value]) => fn(value, key)) },
+  arrayBuffer: async () => Uint8Array.from(body).buffer,
+  text: async () => new TextDecoder().decode(Uint8Array.from(body)),
+} as unknown as Response);
+
+const dshWithCurl = async (
+  script: string,
+  fetch: (url: string, opts?: unknown) => Promise<Response>,
+): Promise<{ stdout: Uint8Array; stderr: string; status: number; readFile: (path: string) => Promise<Uint8Array> }> => {
+  const out: string[] = [];
+  const libcurl: LibCurl = {
+    load_wasm: async () => {},
+    set_websocket: () => {},
+    fetch,
+    WebSocket: class {} as never,
+  };
+  const repl = await bootRepl((text) => out.push(text), {
+    fs: 'memory',
+    net: { loadLibcurl: async () => libcurl, proxyUrl: 'wss://test.invalid/' },
+  });
+  try {
+    const result = await repl.processManager.spawnSync('/bin/dsh', ['-c', script], { cwd: '/' });
+    const fs = (repl.processManager as unknown as { fs: { readFileBytes: (path: string) => Promise<Uint8Array> } }).fs;
+    return { stdout: result.stdout, stderr: decode(result.stderr), status: result.status, readFile: (path) => fs.readFileBytes(path) };
+  } finally {
+    repl.engine.terminate();
+  }
+};
+
 // ─── /bin/curl basic wiring ─────────────────────────────────────────────
 
 test('curl --help prints usage banner', async () => {
@@ -51,15 +85,79 @@ test('curl with no args exits with usage hint', async () => {
   expect(r.stderr.toLowerCase()).toContain('curl');
 }, 60_000);
 
-test('curl -o writes to a TFS file (offline: fetch fails cleanly)', async () => {
-  // No wisp proxy in test env — this exercises the shebang route and error
-  // reporting path. Expect a non-zero exit and a stderr message that names
-  // the error, not an empty output.
-  const r = await dsh('curl -o /tmp/out.txt https://example.com');
-  // Either fetched successfully or failed with a real error message.
-  const failedWithMessage = r.status !== 0 && r.stderr.length > 0 && r.stderr.includes('curl:');
-  const succeeded = r.status === 0;
-  expect(failedWithMessage || succeeded).toBe(true);
+test('curl -o writes raw response bytes to a TFS file', async () => {
+  const r = await dshWithCurl('curl -o /tmp/out.bin https://example.test/file', async () => response(200, 'OK', [0, 255, 65]));
+  expect(r.status).toBe(0);
+  expect([...await r.readFile('/tmp/out.bin')]).toEqual([0, 255, 65]);
+}, 60_000);
+
+test('curl writes raw response bytes to stdout', async () => {
+  const r = await dshWithCurl('curl https://example.test/file', async () => response(200, 'OK', [0, 255, 65]));
+  expect(r.status).toBe(0);
+  expect([...r.stdout]).toEqual([0, 255, 65]);
+}, 60_000);
+
+test('curl -i writes headers followed by raw response bytes', async () => {
+  const r = await dshWithCurl('curl -i https://example.test/file', async () => response(200, 'OK', [0, 255], [['content-type', 'application/octet-stream']]));
+  expect(r.status).toBe(0);
+  expect(decode(r.stdout.slice(0, -2))).toBe('HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\r\n');
+  expect([...r.stdout.slice(-2)]).toEqual([0, 255]);
+}, 60_000);
+
+test('curl -i -o writes headers and body to the output file', async () => {
+  const r = await dshWithCurl('curl -i -o /tmp/result https://example.test/file', async () => response(200, 'OK', [0, 255], [['x-test', 'yes']]));
+  expect(r.status).toBe(0);
+  const file = await r.readFile('/tmp/result');
+  expect(decode(file.slice(0, -2))).toBe('HTTP/1.1 200 OK\r\nx-test: yes\r\n\r\n');
+  expect([...file.slice(-2)]).toEqual([0, 255]);
+}, 60_000);
+
+test('curl preserves a 404 response and body without failing by default', async () => {
+  const r = await dshWithCurl('curl https://example.test/missing', async () => response(404, 'Not Found', [109, 105, 115, 115]));
+  expect(r.status).toBe(0);
+  expect(decode(r.stdout)).toBe('miss');
+  expect(r.stderr).toContain('HTTP 404 Not Found');
+}, 60_000);
+
+test('curl keeps redirects manual unless -L is supplied', async () => {
+  const calls: unknown[] = [];
+  const r = await dshWithCurl('curl https://example.test/redirect', async (_url, opts) => {
+    calls.push(opts);
+    return response(302, 'Found', [], [['location', 'https://example.test/final']]);
+  });
+  expect(r.status).toBe(0);
+  expect(calls).toEqual([{ method: 'GET', headers: {}, redirect: 'manual' }]);
+
+  const followed: unknown[] = [];
+  const r2 = await dshWithCurl('curl -L https://example.test/redirect', async (_url, opts) => {
+    followed.push(opts);
+    return response(200, 'OK', [111, 107]);
+  });
+  expect(r2.status).toBe(0);
+  expect(followed).toEqual([{ method: 'GET', headers: {}, redirect: 'follow' }]);
+}, 60_000);
+
+test('curl rejects invalid flags and missing option values with exit 2', async () => {
+  const unknown = await dshWithCurl('curl --wat https://example.test', async () => response(200, 'OK', []));
+  const missing = await dshWithCurl('curl -o', async () => response(200, 'OK', []));
+  expect(unknown.status).toBe(2);
+  expect(unknown.stderr).toContain('unsupported option: --wat');
+  expect(missing.status).toBe(2);
+  expect(missing.stderr).toContain('option requires an argument: -o');
+}, 60_000);
+
+test.each([
+  ['DNS lookup failed: example.test', 'DNS'],
+  ['connect ECONNREFUSED 127.0.0.1:443', 'connect'],
+  ['TLS certificate verification failed', 'TLS'],
+  ['request timed out after 1000ms', 'timeout'],
+  ['transport unavailable', 'unavailable'],
+  ['unexpected relay failure', 'transport'],
+])('curl categorizes %s transport failures with detail', async (detail, category) => {
+  const r = await dshWithCurl('curl https://example.test', async () => { throw new Error(detail); });
+  expect(r.status).not.toBe(0);
+  expect(r.stderr).toContain('(' + category + ')');
+  expect(r.stderr).toContain(detail);
 }, 60_000);
 
 // ─── /bin/wget basic wiring ─────────────────────────────────────────────
@@ -78,15 +176,18 @@ test('wget with no args exits nonzero', async () => {
 // ─── Shebang routing (regression tests) ─────────────────────────────────
 
 test('shebang router: /bin/dpm --help prints dpm banner', async () => {
-  // dpm-bundle.js starts with `#!/usr/bin/env node`. Before the shebang
-  // router in vendored just-bash's executeUserScript, this was parsed as a
-  // bash script and silently produced no output. Now the router detects
-  // the shebang, resolves `/usr/bin/env node` -> `/bin/node`, and spawns
-  // the interpreter with the script.
   const r = await dsh('dpm --help');
   expect(r.status).toBe(0);
   expect(r.stdout).toContain('dpm');
   expect(r.stdout.toLowerCase()).toContain('usage');
+}, 60_000);
+
+test('dsh routes every direct dpm install argument to the install parser', async () => {
+  const r = await dsh('dpm install tar zip unzip');
+
+  expect(r.status).toBe(1);
+  expect(r.stderr).not.toContain('install requires exactly one package name');
+  expect(r.stderr).not.toContain('not available in the browser Rust core yet');
 }, 60_000);
 
 test('shebang router: /bin/npm --help prints npm-compatible banner', async () => {

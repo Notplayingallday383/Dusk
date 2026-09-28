@@ -232,6 +232,7 @@ export class Interpreter {
     let stdout = "";
     let stderr = "";
     let exitCode = 0;
+    let stdoutKind: ExecResult['stdoutKind'];
     const maxOutputSize = this.ctx.limits.maxOutputSize;
 
     const appendOutput = (nextStdout: string, nextStderr: string): void => {
@@ -257,7 +258,15 @@ export class Interpreter {
         // bytes 0xC3 0xB6); concatenated raw, the lone high byte makes the
         // combined stream invalid UTF-8 and the boundary decoder bails, leaving
         // the byte half as mojibake. Decoding per statement isolates each shape.
-        appendOutput(decodedTextFromResult(result), result.stderr);
+        // A one-statement script can retain raw output for its caller. Once
+        // multiple statements are combined, use text so mixed output remains
+        // unambiguous at the script boundary.
+        if (node.statements.length === 1) {
+          appendOutput(result.stdout, result.stderr);
+          stdoutKind = result.stdoutKind;
+        } else {
+          appendOutput(decodedTextFromResult(result), result.stderr);
+        }
         exitCode = result.exitCode;
         this.ctx.state.lastExitCode = exitCode;
         this.ctx.state.env.set("?", String(exitCode));
@@ -367,6 +376,7 @@ export class Interpreter {
       stderr,
       exitCode,
       env: mapToRecord(this.ctx.state.env),
+      stdoutKind,
     };
   }
 
@@ -429,6 +439,7 @@ export class Interpreter {
       stderr += `${node.sourceText}\n`;
     }
     let exitCode = 0;
+    let stdoutKind: ExecResult['stdoutKind'];
     let lastExecutedIndex = -1;
     let lastPipelineNegated = false;
 
@@ -444,7 +455,12 @@ export class Interpreter {
       // before concatenating, so a statement that joins text-shaped and
       // byte-shaped pipelines with && / || does not interleave raw byte and
       // Unicode chunks (which would defeat the output-boundary UTF-8 decode).
-      stdout += decodedTextFromResult(result);
+      if (node.pipelines.length === 1) {
+        stdout += result.stdout;
+        stdoutKind = result.stdoutKind;
+      } else {
+        stdout += decodedTextFromResult(result);
+      }
       stderr += result.stderr;
       exitCode = result.exitCode;
       lastExecutedIndex = i;
@@ -481,7 +497,7 @@ export class Interpreter {
       throw new ErrexitError(exitCode, stdout, stderr);
     }
 
-    return result(stdout, stderr, exitCode);
+    return { ...result(stdout, stderr, exitCode), stdoutKind };
   }
 
   private async executePipeline(node: PipelineNode): Promise<ExecResult> {

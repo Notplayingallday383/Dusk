@@ -17,8 +17,9 @@
 
 import { Bash } from '../../vendor/just-bash/Bash';
 import { TfsFs } from './tfs-fs';
-import { sqlite3Command } from './commands/sqlite3-command';
 import { python3Command, pythonCommand } from './commands/python3-command';
+import { dpmCommand } from './commands/dpm-command';
+import { curlCommand } from './commands/curl-command';
 
 type ProcessGlobal = {
   argv: string[];
@@ -100,6 +101,27 @@ const buildPositionalEnv = (scriptName: string, args: string[]): Record<string, 
 // exec left in state (which just-bash updates in state.cwd on cd).
 let dshCwdState: string | null = null;
 
+const composeNpmPath = (cwd: string, basePath: string): string => {
+  const entries: string[] = [];
+  const seen = new Set<string>();
+  const add = (entry: string): void => {
+    if (!seen.has(entry)) {
+      seen.add(entry);
+      entries.push(entry);
+    }
+  };
+
+  let directory = cwd === '/' ? '/' : cwd.replace(/\/+$/, '');
+  while (true) {
+    add(`${directory === '/' ? '' : directory}/node_modules/.bin`);
+    if (directory === '/') break;
+    const parent = directory.slice(0, directory.lastIndexOf('/')) || '/';
+    directory = parent;
+  }
+  for (const entry of basePath.split(':')) add(entry);
+  return entries.join(':');
+};
+
 const runOnce = async (
   bash: Bash,
   script: string,
@@ -109,11 +131,15 @@ const runOnce = async (
 ): Promise<number> => {
   const proc = getProc();
   if (dshCwdState === null) dshCwdState = proc?.cwd ? proc.cwd() : '/';
-  const env = positionalArgs.length > 0 || scriptName !== 'dsh'
+  const positionalEnv = positionalArgs.length > 0 || scriptName !== 'dsh'
     ? buildPositionalEnv(scriptName, positionalArgs)
-    : undefined;
-  const opts: Parameters<Bash['exec']>[1] = { cwd: dshCwdState, stdin };
-  if (env) opts.env = env;
+    : {};
+  const path = proc?.env?.PATH ?? '/usr/local/bin:/usr/bin:/bin';
+  const opts: Parameters<Bash['exec']>[1] = {
+    cwd: dshCwdState,
+    stdin,
+    env: { ...(proc?.env ?? {}), ...positionalEnv, PATH: composeNpmPath(dshCwdState, path) },
+  };
   const result = await bash.exec(script, opts);
   // Persist any cd from this invocation. just-bash's exec restores state.cwd
   // after the call, but exposes the final PWD via result.env. Pull that
@@ -121,7 +147,15 @@ const runOnce = async (
   // gets `cd /tmp` to persist between lines.
   const nextPwd = result.env?.['PWD'];
   if (typeof nextPwd === 'string' && nextPwd.length > 0) dshCwdState = nextPwd;
-  if (result.stdout) proc?.stdout.write(result.stdout);
+  if (result.stdout) {
+    if (result.stdoutKind === 'bytes') {
+      const bytes = new Uint8Array(result.stdout.length);
+      for (let i = 0; i < result.stdout.length; i++) bytes[i] = result.stdout.charCodeAt(i) & 0xff;
+      proc?.stdout.write(bytes);
+    } else {
+      proc?.stdout.write(result.stdout);
+    }
+  }
   if (result.stderr) proc?.stderr.write(result.stderr);
   return result.exitCode;
 };
@@ -432,11 +466,19 @@ export const main = async (): Promise<number> => {
     // Enable JS: registers `js-exec` and `node` commands that route to a
     // DuskJS-native in-engine eval (see vendor/just-bash/commands/js-exec/).
     javascript: true,
-    // No network for now (libcurl bridge is DuskJS-side, not exposed to dsh yet).
-    // Custom DuskJS commands: sqlite3 (via host sql.js bridge), python3 (via
-    // host Pyodide bridge). See ./commands/. Each of these routes IPC through
+    // Custom DuskJS commands: python3 (via host Pyodide bridge). See
+    // ./commands/. Each of these routes IPC through
     // the same channel other host funcs use (fs.*, net.*).
-    customCommands: [sqlite3Command, python3Command, pythonCommand],
+    customCommands: [
+      curlCommand,
+      python3Command,
+      pythonCommand,
+      dpmCommand('dpm'),
+      dpmCommand('npm'),
+      dpmCommand('npx'),
+      dpmCommand('pnpm'),
+      dpmCommand('dpx'),
+    ],
   });
 
   let code: number;

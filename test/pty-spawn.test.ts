@@ -72,6 +72,22 @@ test('spawn pty:true: ^C on master delivers SIGINT to child, exit 130', async ()
   expect(code).toBe(130);
 }, 60_000);
 
+test('spawn pty:true: SIGPIPE exits while the primary evaluation is still pending', async () => {
+  const pm = new ProcessManager(createMemoryBackend());
+  pm.registerBinary('/bin/pipe-blocked', 'await new Promise(() => {})');
+  const proc = await pm.spawn('/bin/pipe-blocked', [], { cwd: '/', pty: true });
+
+  try {
+    pm._deliverSignal(proc.pid, 'SIGPIPE');
+    await expect(Promise.race([
+      proc.exit,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('SIGPIPE did not terminate PTY child')), 3_000)),
+    ])).resolves.toBe(141);
+  } finally {
+    proc.kill();
+  }
+}, 60_000);
+
 test('spawn pty:true: in raw mode, ^C bytes pass through without signal', async () => {
   const pm = new ProcessManager(createMemoryBackend());
   pm.registerBinary('/bin/loop', `await new Promise(() => {})`);

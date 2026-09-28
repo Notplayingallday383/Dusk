@@ -17,6 +17,22 @@ test('node:path resolves via require', async () => {
   expect(text).toContain('/foo/baz');
 }, 60_000);
 
+test('node:path exposes posix and win32 aliases via require', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed('const path = require("node:path"); const parsed = path.win32.parse("C:\\\\work\\\\vite.config.ts"); console.log([path.posix === path, path.win32.sep, parsed.root, parsed.dir, parsed.base, parsed.ext, parsed.name].join("|"))\n');
+
+  expect(out.join('')).toContain('true|\\|C:\\|C:\\work|vite.config.ts|.ts|vite.config');
+}, 60_000);
+
+test('node:path normalize preserves relative paths and normalizes POSIX dot segments', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed('const path = require("node:path"); console.log([path.normalize("assets/../main.js"), path.normalize("foo/./bar/"), path.normalize("../foo"), path.normalize("/assets/../main.js"), path.normalize("foo/../"), path.normalize("./"), path.normalize("")].join("|"))\n');
+
+  expect(out.join('')).toContain('main.js|foo/bar/|../foo|/main.js|./|./|.');
+}, 60_000);
+
 test('node:fs promises round-trips via require', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
@@ -28,6 +44,20 @@ test('node:fs promises round-trips via require', async () => {
     await new Promise((r) => setTimeout(r, 50));
   }
   expect(out.join('')).toContain('node-fs-works');
+}, 60_000);
+
+test('node:fs realpathSync.native aliases realpathSync', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed(
+    'const fs = require("node:fs"); fs.writeFileSync("/native-realpath.txt", "ok"); ' +
+      'console.log([fs.realpathSync.native === fs.realpathSync, fs.realpathSync.native("/native-realpath.txt")].join("|"))\n',
+  );
+  const deadline = Date.now() + 10_000;
+  while (out.join('').indexOf('true|/native-realpath.txt') === -1 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  expect(out.join('')).toContain('true|/native-realpath.txt');
 }, 60_000);
 
 test('node:fs accessSync throws ENOENT with syscall+path', async () => {
@@ -45,11 +75,11 @@ test('node:fs accessSync throws ENOENT with syscall+path', async () => {
   expect(text).toContain('CODE=ENOENT;SYS=access;PATH=/nope-access.txt');
 }, 60_000);
 
-test('node:fs realpathSync throws ENOENT with syscall+path', async () => {
+test('node:fs realpathSync.native throws ENOENT with syscall+path', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
   await repl.feed(
-    'const fs = require("node:fs"); (() => { try { fs.realpathSync("/nope-real.txt"); } ' +
+    'const fs = require("node:fs"); (() => { try { fs.realpathSync.native("/nope-real.txt"); } ' +
       'catch (e) { console.log("CODE=" + e.code + ";SYS=" + e.syscall + ";PATH=" + e.path); } })()\n',
   );
   const deadline = Date.now() + 10_000;

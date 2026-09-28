@@ -2,30 +2,53 @@ import {
   ProcessManager,
   type DuskProcessHandle,
   type RelayListener,
+  type SshOptions,
 } from './host/process-manager';
-import { createNet, type LibCurl } from './host/net';
+import { createNet, type LibCurl, type NetHost } from './host/net';
+import { createWispTcpProvider, createWispTlsTcpProvider, type TcpProvider, type TcpRelayAttachment } from './host/tcp';
+import type { RelayListenAuthorizer, TlsServerConnection } from './host/relay-tls-server';
 import { createMemoryBackend, createTfsBackend, type FSBackend } from './host/fs-backend';
 import { createLayoutBackend } from './host/fs-layout';
-import { createSqliteFuncs } from './host/sqlite';
 import { createPythonFuncs } from './host/python';
+import { loadDuskExtensions, type DuskExtensionHost } from './host/extensions';
 import { startRepl, type DuskRepl } from './repl/repl';
-import type { EngineInstance, FuncTable } from './host/engine-instance';
+import { createEngineFactory, type DuskRuntime, type EngineInstance, type FuncTable } from './host/engine-instance';
+import type { NativePackageReplacementEntries } from './host/native-package-registry';
 
 export { createRunner } from './host/runner';
 export { createEngine } from './host/engine-instance';
+export { createEngineFactory, createNativeEngine, createSpiderMonkeyLegacyEngine } from './host/engine-instance';
+export type { DuskRuntime, EngineFactory } from './host/engine-instance';
 export { ProcessManager } from './host/process-manager';
-export type { RelayListener, RelaySocket } from './host/process-manager';
+export type { DuskRelayCapability, MoonbeamAttachableRelay, MoonbeamAttachmentMetadata, RelayListener, RelaySocket, SshAdapter, SshAdapterContext, SshHostKeyVerification, SshOptions, SshWasmSource, StreamingHostBinary, StreamingHostBinaryContext, StreamingHostProcess } from './host/process-manager';
 export { startRepl } from './repl/repl';
 export { createMemoryBackend, createTfsBackend } from './host/fs-backend';
+export type { FSBackend } from './host/fs-backend';
+export type { FuncTable } from './host/engine-instance';
 export { createLayoutBackend } from './host/fs-layout';
+export { createRelayTlsServer } from './host/relay-tls-server';
+export type { RelayListenAuthorizer, RelayListenRequest, RelayTlsPlaintextSocket, RelayTlsServer, RelayTlsServerOptions, TlsServerConnection } from './host/relay-tls-server';
 export { initEnginePool, isPoolWarm } from './host/engine-pool';
 export { prewarmEngine } from './engine/spidermonkey';
+export { createNativePackageRegistry } from './host/native-package-registry';
+export type { NativePackageRegistry, NativePackageReplacementEntries } from './host/native-package-registry';
+export { createTcpProvider, createWispTcpProvider, createWispTlsTcpProvider } from './host/tcp';
+export { loadDuskExtensions } from './host/extensions';
+export type { DuskExtensionHost, DuskExtensionManifest } from './host/extensions';
+export type { TcpOpenOptions, TcpProvider, TcpRelayAttachment, TcpStream, WispTlsTcpProviderOptions } from './host/tcp';
 
 export type BootReplNetOptions =
-  | { loadLibcurl: () => Promise<LibCurl>; proxyUrl: string; relay?: RelayListener }
-  | { relay: RelayListener; loadLibcurl?: never; proxyUrl?: never };
+  | { loadLibcurl: () => Promise<LibCurl>; proxyUrl: string; relay?: RelayListener & Partial<TcpRelayAttachment>; relayTls?: RelayTlsHostCapability; tcp?: boolean; tcpProvider?: TcpProvider }
+  | { relay: RelayListener; relayTls?: RelayTlsHostCapability; loadLibcurl?: never; proxyUrl?: never; tcp?: boolean; tcpProvider?: TcpProvider }
+  | { tcpProvider: TcpProvider; relay?: RelayListener & Partial<TcpRelayAttachment>; relayTls?: RelayTlsHostCapability; loadLibcurl?: never; proxyUrl?: never; tcp?: boolean };
+
+export interface RelayTlsHostCapability {
+  Connection: new (certificateChain: string | Uint8Array, privateKey: string | Uint8Array, options?: unknown) => TlsServerConnection;
+  authorize: RelayListenAuthorizer;
+}
 
 export interface BootReplOptions {
+  runtime?: DuskRuntime;
   net?: BootReplNetOptions;
   seed?: Record<string, string>;
   fs?: 'tfs' | 'memory';
@@ -49,14 +72,25 @@ export interface BootReplOptions {
    * Default: false (creates pid-0 for backwards compat).
    */
   skipPidZero?: boolean;
+  /** Exact native-dependent package specifiers replaced by host-owned browser source. */
+  nativePackageReplacements?: NativePackageReplacementEntries;
+  /** Host-supplied SSH bridge over the active MoonBeam relay. */
+  ssh?: SshOptions;
+  /** Explicit host extensions activated from packages already installed by DPM. */
+  extensions?: readonly DuskExtensionHost[];
+  /** Project whose DPM lockfile authorizes the requested extensions. */
+  extensionCwd?: string;
 }
 
 export interface BootReplResult extends DuskRepl {
   processManager: ProcessManager;
+  /** Dusk's configured raw/TLS provider, suitable for NodeWorker's Dusk adapter. */
+  tcpProvider?: TcpProvider;
   /** pid-0 engine. Present unless `skipPidZero: true`, in which case it's a stub. */
   engine: EngineInstance;
   /** Present when `via: 'node'` — the spawned /bin/node child handle. */
   node?: DuskProcessHandle;
+  registerWispTransport(name: string, factory: unknown): void;
 }
 
 export const bootRepl = async (
@@ -66,37 +100,71 @@ export const bootRepl = async (
   const user = options?.user ?? 'user';
   const hostname = options?.hostname ?? 'duskjs';
   const useLayout = options?.layout !== false;
+  const runtime = options?.runtime ?? 'native';
+  const engineFactory = createEngineFactory(runtime);
 
-  // Pre-warm the engine pool so additional spawns are faster.
-  // Idempotent across calls.
-  const { initEnginePool } = await import('./host/engine-pool');
-  initEnginePool();
+  if (runtime === 'spidermonkey-legacy') {
+    const { initEnginePool } = await import('./host/engine-pool');
+    initEnginePool();
+  }
 
   const persistent: FSBackend = (options?.fs ?? 'tfs') === 'memory'
     ? createMemoryBackend()
     : await createTfsBackend();
 
   const engineHolder: { engine: EngineInstance | null } = { engine: null };
+  let pm!: ProcessManager;
   let netFuncs: FuncTable = {};
+  let net: NetHost | undefined;
+  let cleanupNetworkForPid: ((pid: number) => void) | undefined;
+  const netOptions = options?.net;
+  const configuredRelay = netOptions?.relay;
+  const tcpRelay = configuredRelay && typeof (configuredRelay as Partial<TcpRelayAttachment>).attach === 'function'
+    ? configuredRelay as RelayListener & TcpRelayAttachment
+    : undefined;
+  const tcpProvider = netOptions?.tcpProvider
+    ?? (netOptions?.tcp !== false && (netOptions?.proxyUrl || tcpRelay)
+      ? netOptions?.loadLibcurl && netOptions.proxyUrl
+        ? createWispTlsTcpProvider({ proxyUrl: netOptions.proxyUrl, loadLibcurl: netOptions.loadLibcurl })
+        : createWispTcpProvider({
+          ...(tcpRelay ? { relay: tcpRelay } : {}),
+          ...(netOptions?.proxyUrl ? { proxyUrl: netOptions.proxyUrl } : {}),
+        })
+      : undefined);
   if (options?.net?.loadLibcurl) {
-    const net = createNet(
+    net = createNet(
       options.net.loadLibcurl,
-      (js) => { if (engineHolder.engine) engineHolder.engine.dispatch(js); },
+      (js, pid) => {
+        if (pid === undefined || pid === 0) engineHolder.engine?.dispatch(js);
+        else pm.dispatch(pid, js);
+      },
       options.net.proxyUrl,
     );
     netFuncs = net.funcs;
+    cleanupNetworkForPid = net.cleanupForPid;
   }
+  const registerWispTransport = (name: string, factory: unknown): void => {
+    if (!net) throw new Error('bootRepl: registerWispTransport requires net.loadLibcurl');
+    net.registerWispTransport(name, factory);
+  };
 
   let backend: FSBackend;
-  let pm: ProcessManager;
-  const processManagerOptions = options?.net?.relay ? { relay: options.net.relay } : {};
-  // sqlite/python bridges get the same FSBackend the process manager sees.
+  const processManagerOptions = {
+    ...(options?.net?.relay ? { relay: options.net.relay } : {}),
+    ...(options?.net?.relayTls ? { relayTls: options.net.relayTls } : {}),
+    ...(cleanupNetworkForPid ? { cleanupNetworkForPid } : {}),
+    ...(tcpProvider ? { tcpProvider } : {}),
+    ...(net ? { dpmFetch: net.fetch, dpmFetchBytes: net.fetchBytes } : {}),
+    ...(options?.nativePackageReplacements ? { nativePackageReplacements: options.nativePackageReplacements } : {}),
+    ...(options?.ssh ? { ssh: options.ssh } : {}),
+  };
+  // Host bridges get the same FSBackend the process manager sees.
   // We build them AFTER pm construction (see below) once `backend` is bound.
   let extraFuncs: FuncTable = {};
   if (useLayout) {
     const ephemeral = createMemoryBackend();
     // Build pm with persistent first (so binaries get registered), then swap to layout
-    pm = new ProcessManager(persistent, netFuncs, {}, processManagerOptions);
+    pm = new ProcessManager(persistent, netFuncs, {}, { ...processManagerOptions, engineFactory });
     backend = await createLayoutBackend({
       ephemeral,
       persistent,
@@ -107,16 +175,8 @@ export const bootRepl = async (
     (pm as unknown as { fs: FSBackend }).fs = backend;
   } else {
     backend = persistent;
-    pm = new ProcessManager(backend, netFuncs, {}, processManagerOptions);
+    pm = new ProcessManager(backend, netFuncs, {}, { ...processManagerOptions, engineFactory });
   }
-  // Register sqlite and python IPC bridges against the effective backend.
-  // Merge into the pm's netFuncs bag so all subsequent spawns see them.
-  extraFuncs = { ...createSqliteFuncs(backend), ...createPythonFuncs(backend) };
-  (pm as unknown as { netFuncs: FuncTable }).netFuncs = {
-    ...(pm as unknown as { netFuncs: FuncTable }).netFuncs,
-    ...extraFuncs,
-  };
-
   for (const [path, contents] of Object.entries(options?.seed ?? {})) {
     const segs = path.split('/').filter(Boolean);
     segs.pop();
@@ -124,6 +184,19 @@ export const bootRepl = async (
     for (const s of segs) { cur += '/' + s; if (!(await backend.exists(cur))) await backend.mkdir(cur); }
     await backend.writeFile(path, contents);
   }
+
+  // Register Python and explicitly authorized extension bridges.
+  // Merge into the pm's netFuncs bag so all subsequent spawns see them.
+  extraFuncs = { ...createPythonFuncs(backend) };
+  const extensions = await loadDuskExtensions(backend, options?.extensionCwd ?? `/home/${user}`, options?.extensions ?? []);
+  for (const extension of extensions) {
+    Object.assign(extraFuncs, extension.funcs);
+    for (const [path, source] of Object.entries(extension.binaries)) pm.registerBinary(path, source);
+  }
+  (pm as unknown as { netFuncs: FuncTable }).netFuncs = {
+    ...(pm as unknown as { netFuncs: FuncTable }).netFuncs,
+    ...extraFuncs,
+  };
 
   // Optionally skip pid-0 — saves ~100MB of RAM by not spawning an entire
   // SpiderMonkey Worker for the `feed()` path. Only meaningful for callers
@@ -138,7 +211,7 @@ export const bootRepl = async (
       run: async (): Promise<void> => {
         throw new Error('bootRepl: pid-0 engine skipped (skipPidZero:true); use processManager.spawn instead');
       },
-      dispatch: (): void => {
+      dispatch: async (): Promise<void> => {
         throw new Error('bootRepl: pid-0 engine skipped (skipPidZero:true)');
       },
       terminate: async (): Promise<number> => { terminated = true; return 0; },
@@ -180,7 +253,7 @@ export const bootRepl = async (
     const feed = async (line: string): Promise<void> => {
       await nodeHandle.stdin.write(encoder.encode(line + '\n'));
     };
-    return { feed, processManager: pm, engine, node: nodeHandle };
+    return { feed, processManager: pm, engine, node: nodeHandle, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
   }
 
   if (options?.skipPidZero) {
@@ -189,9 +262,9 @@ export const bootRepl = async (
     const feed = async (): Promise<void> => {
       throw new Error('bootRepl: feed() unavailable when skipPidZero:true. Spawn a shell via processManager.spawn(\'/bin/dsh\', ...) and write to its stdin.');
     };
-    return { feed, processManager: pm, engine };
+    return { feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
   }
 
   const repl = startRepl(engine, write);
-  return { feed: repl.feed, processManager: pm, engine };
+  return { feed: repl.feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
 };

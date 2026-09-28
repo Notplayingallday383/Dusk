@@ -1,0 +1,6 @@
+{
+  "name": "esbuild-wasm",
+  "version": "0.21.5",
+  "tarball": "https://registry.npmjs.org/esbuild-wasm/-/esbuild-wasm-0.21.5.tgz",
+  "integrity": "sha512-L/FlOPMMFtw+6qPAbuPvJXdrOYOp9yx/PEwSrIZW0qghY4vgV003evdYDwqQ/9ENMQI0B6RMod9xT4FHtto6OQ=="
+}

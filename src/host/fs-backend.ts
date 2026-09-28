@@ -1,4 +1,4 @@
-import { createVFS, decodeUtf8 } from './vfs';
+import { createVFS, decodeUtf8, norm } from './vfs';
 
 export interface FSCaller {
   pid: number;
@@ -7,11 +7,21 @@ export interface FSCaller {
 export interface FSStat {
   isFile: boolean;
   isDirectory: boolean;
+  size: number;
+  mtimeMs: number;
+  atimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
 }
 
 export interface FSReadResult { bytes: Uint8Array; bytesRead: number; }
 export interface FSWriteResult { bytesWritten: number; }
-export interface FSFstat { isFile: boolean; isDirectory: boolean; size: number; }
+export interface FSFstat extends FSStat {}
+export interface FSMutation {
+  type: 'write' | 'mkdir' | 'rename' | 'rm';
+  path: string;
+  previousPath?: string;
+}
 
 // Flag constants — match Node's posix values exactly.
 export const O_RDONLY = 0;
@@ -33,6 +43,7 @@ export interface FSBackend {
   exists(path: string, caller?: FSCaller): Promise<boolean>;
   stat(path: string, caller?: FSCaller): Promise<FSStat>;
   rename(from: string, to: string, caller?: FSCaller): Promise<void>;
+  subscribe(listener: (event: FSMutation) => void): () => void;
   // fd ops — backend-local handle space; ProcessManager maps per-pid fd -> handle.
   openHandle(path: string, flags: number, caller?: FSCaller): Promise<{ handle: number; size: number; appendOnly: boolean }>;
   readHandle(handle: number, length: number, position: number, caller?: FSCaller): Promise<FSReadResult>;
@@ -57,29 +68,42 @@ export const createMemoryBackend = (): FSBackend => {
   const vfs = createVFS();
   interface Handle { path: string; flags: number; appendOnly: boolean; closed: boolean; }
   const handles = new Map<number, Handle>();
+  const listeners = new Set<(event: FSMutation) => void>();
+  const emit = (event: FSMutation): void => {
+    const normalized = event.previousPath === undefined
+      ? { ...event, path: norm(event.path) }
+      : { ...event, path: norm(event.path), previousPath: norm(event.previousPath) };
+    for (const listener of listeners) {
+      try { listener(normalized); } catch { /* Listeners cannot invalidate completed mutations. */ }
+    }
+  };
   let nextHandle = 1;
 
   return {
     readFile: async (path) => vfs.readFile(path),
-    writeFile: async (path, data) => { vfs.writeFile(path, data); },
+    writeFile: async (path, data) => { vfs.writeFile(path, data); emit({ type: 'write', path }); },
     readFileBytes: async (path) => vfs.readFileBytes(path),
-    writeFileBytes: async (path, data) => { vfs.writeFileBytes(path, data); },
+    writeFileBytes: async (path, data) => { vfs.writeFileBytes(path, data); emit({ type: 'write', path }); },
     readdir: async (path) => vfs.readdir(path),
-    mkdir: async (path, opts) => { vfs.mkdir(path, opts); },
-    rm: async (path) => { vfs.rm(path); },
+    mkdir: async (path, opts) => { vfs.mkdir(path, opts); emit({ type: 'mkdir', path }); },
+    rm: async (path) => { vfs.rm(path); emit({ type: 'rm', path }); },
     exists: async (path) => vfs.exists(path),
     stat: async (path) => vfs.stat(path),
-    rename: async (from, to) => { vfs.rename(from, to); },
+    rename: async (from, to) => { vfs.rename(from, to); emit({ type: 'rename', path: to, previousPath: from }); },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     symlink: async (target, path) => { vfs.symlink(target, path); },
     readlink: async (path) => vfs.readlink(path),
     lstat: async (path) => vfs.lstat(path),
 
     openHandle: async (path, flags) => {
       const exists = vfs.exists(path);
-      if (!exists && (flags & O_CREAT) !== 0) vfs.writeFileBytes(path, new Uint8Array(0));
+      if (!exists && (flags & O_CREAT) !== 0) { vfs.writeFileBytes(path, new Uint8Array(0)); emit({ type: 'write', path }); }
       else if (!exists) throw errWithCode('ENOENT: ' + path, 'ENOENT');
       if ((flags & O_EXCL) !== 0 && exists) throw errWithCode('EEXIST: ' + path, 'EEXIST');
-      if ((flags & O_TRUNC) !== 0) vfs.writeFileBytes(path, new Uint8Array(0));
+      if ((flags & O_TRUNC) !== 0) { vfs.writeFileBytes(path, new Uint8Array(0)); emit({ type: 'write', path }); }
       const appendOnly = (flags & O_APPEND) !== 0;
       const size = vfs.fileSize(path);
       const handle = nextHandle++;
@@ -107,6 +131,7 @@ export const createMemoryBackend = (): FSBackend => {
       next.set(cur);
       next.set(data, writePos);
       vfs.writeFileBytes(h.path, next);
+      emit({ type: 'write', path: h.path });
       return { bytesWritten: data.length };
     },
     closeHandle: async (handle) => {
@@ -119,7 +144,7 @@ export const createMemoryBackend = (): FSBackend => {
       const h = handles.get(handle);
       if (!h || h.closed) throw errWithCode('EBADF', 'EBADF');
       const s = vfs.stat(h.path);
-      return { isFile: s.isFile, isDirectory: s.isDirectory, size: vfs.fileSize(h.path) };
+      return s;
     },
     ftruncateHandle: async (handle, length) => {
       const h = handles.get(handle);
@@ -128,6 +153,7 @@ export const createMemoryBackend = (): FSBackend => {
       const next = new Uint8Array(length);
       next.set(cur.subarray(0, Math.min(cur.length, length)));
       vfs.writeFileBytes(h.path, next);
+      emit({ type: 'write', path: h.path });
     },
     fsyncHandle: async () => { /* memory backend is synchronous; nothing to flush */ },
   };
@@ -145,7 +171,52 @@ interface TfsFsPromises {
   exists(path: string): Promise<boolean>;
 }
 
-interface TfsInstance { fs: { promises: TfsFsPromises } }
+interface TfsState { promises: TfsFsPromises; perms: Record<string, unknown> }
+interface TfsInstance { handle: FileSystemDirectoryHandle; fs: TfsState; shell: { fs: TfsState } }
+
+interface TfsMetadata {
+  mtimeMs: number;
+  atimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+}
+
+const TFS_METADATA_PATH = '/.dusk-metadata.json';
+const TFS_STORE_PATH = '.TFS_STORE';
+const TFS_MUTATION_LOCK = 'dusk-tfs-metadata';
+
+const withTfsMutationLock = <T>(task: () => Promise<T>): Promise<T> => {
+  const locks = navigator.locks;
+  if (!locks) return Promise.reject(new Error('Persistent TFS backend requires the Web Locks API for origin-wide metadata serialization'));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error('Timed out waiting for TFS metadata lock')), 5_000);
+  return (async () => {
+    try {
+      return await locks.request(TFS_MUTATION_LOCK, { mode: 'exclusive', signal: controller.signal }, async () => task());
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
+};
+
+const initializeTfsStore = async (): Promise<void> => {
+  const root = await navigator.storage.getDirectory();
+  const handle = await root.getFileHandle(TFS_STORE_PATH, { create: true });
+  if ((await handle.getFile()).size > 0) return;
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify({
+    '/.TFS_STORE': { perms: ['r'], uid: 0, gid: 0 },
+  }, null, 2));
+  await writable.close();
+};
+
+const waitForTfsInitialization = async (tfs: TfsInstance): Promise<void> => {
+  const deadline = Date.now() + 5_000;
+  while (!tfs.fs.perms['/.TFS_STORE'] || !tfs.shell.fs.perms['/.TFS_STORE']) {
+    if (Date.now() >= deadline) throw new Error('TFS initialization did not complete');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+};
 
 const toUint8 = (v: unknown): Uint8Array => {
   if (v instanceof Uint8Array) return v;
@@ -159,18 +230,116 @@ const toUint8 = (v: unknown): Uint8Array => {
 };
 
 export const createTfsBackend = async (): Promise<FSBackend> => {
+  if (!navigator.locks) throw new Error('Persistent TFS backend requires the Web Locks API for origin-wide metadata serialization');
+  await initializeTfsStore();
   const { TFS } = (await import('@terbiumos/tfs/browser')) as unknown as {
     TFS: { init(): Promise<TfsInstance> };
   };
   const tfs = await TFS.init();
+  await waitForTfsInitialization(tfs);
   const p = tfs.fs.promises;
+  const waitForTfsPermission = async (path: string): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        const handle = await tfs.handle.getFileHandle(TFS_STORE_PATH);
+        const permissions = JSON.parse(await (await handle.getFile()).text()) as Record<string, unknown>;
+        if (permissions[norm(path)]) return;
+      } catch { /* TFS may still have its metadata file open for writing. */ }
+      if (Date.now() >= deadline) throw new Error(`TFS metadata did not persist ${path}`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  const metadata = new Map<string, TfsMetadata>();
+  let lastTimestamp = 0;
+  const readPersistedMetadata = async (): Promise<Map<string, TfsMetadata>> => {
+    const persisted = new Map<string, TfsMetadata>();
+    if (!(await p.exists(TFS_METADATA_PATH))) return persisted;
+    const stored = JSON.parse(String(await p.readFile(TFS_METADATA_PATH, 'utf8'))) as Record<string, TfsMetadata>;
+    for (const [path, value] of Object.entries(stored)) {
+      if (typeof value?.mtimeMs !== 'number' || typeof value.atimeMs !== 'number'
+        || typeof value.ctimeMs !== 'number' || typeof value.birthtimeMs !== 'number') continue;
+      persisted.set(path, value);
+    }
+    return persisted;
+  };
+  const syncMetadataCache = (latest: Map<string, TfsMetadata>): void => {
+    metadata.clear();
+    lastTimestamp = 0;
+    for (const [path, value] of latest) {
+      metadata.set(path, value);
+      lastTimestamp = Math.max(lastTimestamp, value.mtimeMs, value.atimeMs, value.ctimeMs, value.birthtimeMs);
+    }
+  };
+  syncMetadataCache(await readPersistedMetadata());
+  const timestamp = (latest: Map<string, TfsMetadata>): number => {
+    for (const value of latest.values()) {
+      lastTimestamp = Math.max(lastTimestamp, value.mtimeMs, value.atimeMs, value.ctimeMs, value.birthtimeMs);
+    }
+    lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+    return lastTimestamp;
+  };
+  const updateMetadataUnlocked = async <T>(mutate: (latest: Map<string, TfsMetadata>) => T): Promise<T> => {
+    const latest = await readPersistedMetadata();
+    const result = mutate(latest);
+    await p.writeFile(TFS_METADATA_PATH, JSON.stringify(Object.fromEntries(latest)), 'utf8');
+    await waitForTfsPermission(TFS_METADATA_PATH);
+    syncMetadataCache(latest);
+    return result;
+  };
+  const metadataForUnlocked = async (path: string): Promise<TfsMetadata> => updateMetadataUnlocked((latest) => {
+    const existing = latest.get(path);
+    if (existing) return existing;
+    const now = timestamp(latest);
+    const created = { mtimeMs: now, atimeMs: now, ctimeMs: now, birthtimeMs: now };
+    latest.set(path, created);
+    return created;
+  });
+  const metadataFor = (path: string): Promise<TfsMetadata> =>
+    withTfsMutationLock(() => metadataForUnlocked(path));
+  const touchUnlocked = async (path: string): Promise<void> => {
+    await updateMetadataUnlocked((latest) => {
+      const existing = latest.get(path);
+      const now = timestamp(latest);
+      latest.set(path, existing
+        ? { ...existing, mtimeMs: now, ctimeMs: now }
+        : { mtimeMs: now, atimeMs: now, ctimeMs: now, birthtimeMs: now });
+    });
+  };
+  const removeMetadataUnlocked = async (path: string): Promise<void> => {
+    await updateMetadataUnlocked((latest) => {
+      for (const key of latest.keys()) {
+        if (key === path || key.startsWith(path + '/')) latest.delete(key);
+      }
+    });
+  };
+  const moveMetadataUnlocked = async (from: string, to: string): Promise<void> => {
+    await updateMetadataUnlocked((latest) => {
+      const moved = [...latest.entries()].filter(([path]) => path === from || path.startsWith(from + '/'));
+      for (const [path] of moved) latest.delete(path);
+      for (const [path, value] of moved) latest.set(to + path.slice(from.length), value);
+    });
+  };
+  const listeners = new Set<(event: FSMutation) => void>();
+  const emit = (event: FSMutation): void => {
+    const normalized = event.previousPath === undefined
+      ? { ...event, path: norm(event.path) }
+      : { ...event, path: norm(event.path), previousPath: norm(event.previousPath) };
+    for (const listener of listeners) {
+      try { listener(normalized); } catch { /* Listeners cannot invalidate completed mutations. */ }
+    }
+  };
   const ensureParents = async (path: string): Promise<void> => {
     const segs = path.split('/').filter(Boolean);
     segs.pop();
     let cur = '';
     for (const s of segs) {
       cur += '/' + s;
-      if (!(await p.exists(cur))) await p.mkdir(cur);
+      if (!(await p.exists(cur))) {
+        await p.mkdir(cur);
+        await waitForTfsPermission(cur);
+        await touchUnlocked(cur);
+      }
     }
   };
 
@@ -189,6 +358,8 @@ export const createTfsBackend = async (): Promise<FSBackend> => {
     const ab = new Uint8Array(data.length);
     ab.set(data);
     await p.writeFile(path, ab.buffer, 'arraybuffer');
+    await waitForTfsPermission(path);
+    await touchUnlocked(path);
   };
 
   return {
@@ -202,50 +373,88 @@ export const createTfsBackend = async (): Promise<FSBackend> => {
       }
     },
     writeFile: async (path, data) => {
-      await ensureParents(path);
-      await p.writeFile(path, data, 'utf8');
+      await withTfsMutationLock(async () => {
+        await ensureParents(path);
+        await p.writeFile(path, data, 'utf8');
+        await waitForTfsPermission(path);
+        await touchUnlocked(path);
+      });
+      emit({ type: 'write', path });
     },
     readFileBytes: async (path) => readBytes(path),
-    writeFileBytes: async (path, data) => { await writeBytes(path, data); },
-    readdir: async (path) => p.readdir(path),
+    writeFileBytes: async (path, data) => {
+      await withTfsMutationLock(() => writeBytes(path, data));
+      emit({ type: 'write', path });
+    },
+    readdir: async (path) => (await p.readdir(path)).filter((entry) => !(norm(path) === '/' && entry === TFS_METADATA_PATH.slice(1))),
     mkdir: async (path, opts) => {
-      if (opts?.recursive) {
-        const segs = path.split('/').filter(Boolean);
-        let cur = '';
-        for (const s of segs) { cur += '/' + s; if (!(await p.exists(cur))) await p.mkdir(cur); }
-      } else {
-        await p.mkdir(path);
-      }
+      await withTfsMutationLock(async () => {
+        if (opts?.recursive) {
+          const segs = path.split('/').filter(Boolean);
+          let cur = '';
+          for (const s of segs) {
+            cur += '/' + s;
+            if (!(await p.exists(cur))) {
+              await p.mkdir(cur);
+              await waitForTfsPermission(cur);
+              await touchUnlocked(cur);
+            }
+          }
+        } else {
+          await p.mkdir(path);
+          await waitForTfsPermission(path);
+          await touchUnlocked(path);
+        }
+      });
+      emit({ type: 'mkdir', path });
     },
     rm: async (path, opts) => {
-      const st = await p.stat(path);
-      if (st && st.isDirectory()) await p.rmdir(path, { recursive: opts?.recursive ?? true });
-      else await p.unlink(path);
+      await withTfsMutationLock(async () => {
+        const st = await p.stat(path);
+        if (st && st.isDirectory()) await p.rmdir(path, { recursive: opts?.recursive ?? true });
+        else await p.unlink(path);
+        await removeMetadataUnlocked(path);
+      });
+      emit({ type: 'rm', path });
     },
     exists: async (path) => p.exists(path),
     stat: async (path) => {
       const st = await p.stat(path);
       if (!st) throw new Error('ENOENT: ' + path);
-      return { isFile: st.isFile(), isDirectory: st.isDirectory() };
+      const isFile = st.isFile();
+      const size = isFile ? (await readBytes(path)).length : 0;
+      return { isFile, isDirectory: st.isDirectory(), size, ...await metadataFor(path) };
     },
-    rename: async (from, to) => { await p.rename(from, to); },
+    rename: async (from, to) => {
+      await withTfsMutationLock(async () => {
+        await metadataForUnlocked(from);
+        await p.rename(from, to);
+        await moveMetadataUnlocked(from, to);
+      });
+      emit({ type: 'rename', path: to, previousPath: from });
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
 
-    openHandle: async (path, flags) => {
-      const exists = await p.exists(path);
-      if (!exists && (flags & O_CREAT) !== 0) {
-        await ensureParents(path);
-        await writeBytes(path, new Uint8Array(0));
-      } else if (!exists) {
-        throw errWithCode('ENOENT: ' + path, 'ENOENT');
-      }
-      if ((flags & O_EXCL) !== 0 && exists) throw errWithCode('EEXIST: ' + path, 'EEXIST');
-      const contents = (flags & O_TRUNC) ? new Uint8Array(0) : await readBytes(path);
-      if ((flags & O_TRUNC) !== 0) await writeBytes(path, contents);
-      const appendOnly = (flags & O_APPEND) !== 0;
-      const handle = nextTfsHandle++;
-      tfsHandles.set(handle, { path, flags, appendOnly, contents, dirty: false, closed: false });
-      return { handle, size: contents.length, appendOnly };
-    },
+    openHandle: async (path, flags) => withTfsMutationLock(async () => {
+        const exists = await p.exists(path);
+        if (!exists && (flags & O_CREAT) !== 0) {
+          await ensureParents(path);
+          await writeBytes(path, new Uint8Array(0));
+          emit({ type: 'write', path });
+        } else if (!exists) {
+          throw errWithCode('ENOENT: ' + path, 'ENOENT');
+        }
+        if ((flags & O_EXCL) !== 0 && exists) throw errWithCode('EEXIST: ' + path, 'EEXIST');
+        const contents = (flags & O_TRUNC) ? new Uint8Array(0) : await readBytes(path);
+        if ((flags & O_TRUNC) !== 0) { await writeBytes(path, contents); emit({ type: 'write', path }); }
+        const appendOnly = (flags & O_APPEND) !== 0;
+        const handle = nextTfsHandle++;
+        tfsHandles.set(handle, { path, flags, appendOnly, contents, dirty: false, closed: false });
+        return { handle, size: contents.length, appendOnly };
+      }),
     readHandle: async (handle, length, position) => {
       const h = tfsHandles.get(handle);
       if (!h || h.closed) throw errWithCode('EBADF', 'EBADF');
@@ -269,14 +478,17 @@ export const createTfsBackend = async (): Promise<FSBackend> => {
     closeHandle: async (handle) => {
       const h = tfsHandles.get(handle);
       if (!h) throw errWithCode('EBADF', 'EBADF');
-      if (h.dirty) await writeBytes(h.path, h.contents);
+      if (h.dirty) {
+        await withTfsMutationLock(() => writeBytes(h.path, h.contents));
+        emit({ type: 'write', path: h.path });
+      }
       h.closed = true;
       tfsHandles.delete(handle);
     },
     fstatHandle: async (handle) => {
       const h = tfsHandles.get(handle);
       if (!h || h.closed) throw errWithCode('EBADF', 'EBADF');
-      return { isFile: true, isDirectory: false, size: h.contents.length };
+      return { isFile: true, isDirectory: false, size: h.contents.length, ...await metadataFor(h.path) };
     },
     ftruncateHandle: async (handle, length) => {
       const h = tfsHandles.get(handle);
@@ -289,8 +501,11 @@ export const createTfsBackend = async (): Promise<FSBackend> => {
     fsyncHandle: async (handle) => {
       const h = tfsHandles.get(handle);
       if (!h || h.closed) throw errWithCode('EBADF', 'EBADF');
-      if (h.dirty) { await writeBytes(h.path, h.contents); h.dirty = false; }
+      if (h.dirty) {
+        await withTfsMutationLock(() => writeBytes(h.path, h.contents));
+        h.dirty = false;
+        emit({ type: 'write', path: h.path });
+      }
     },
   };
 };
-

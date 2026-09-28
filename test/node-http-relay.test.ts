@@ -40,6 +40,7 @@ class FakeRelaySocket implements RelaySocket {
 }
 
 class FakeRelay implements RelayListener {
+  authorizeListen = (): boolean => true;
   registrations: Array<{ host: string; port: number }> = [];
   disposed = 0;
   private handlers = new Map<string, (socket: RelaySocket) => void>();
@@ -100,6 +101,40 @@ test('node:http mirrors a named listener into the relay and bridges inbound byte
     expect(response).toContain('Content-Length: 8\r\n');
     expect(response).toContain('\r\n\r\nrelay-ok');
     await waitFor(() => relay.disposed === 1 && socket.closeReasons.length === 1);
+  } finally {
+    await repl.engine.terminate();
+  }
+}, 60_000);
+
+test('node:http relays upgrade head bytes and leaves the socket duplex', async () => {
+  const relay = new FakeRelay();
+  const out: string[] = [];
+  const repl = await bootRepl((text) => out.push(text), { fs: 'memory', net: { relay } });
+
+  try {
+    await repl.feed([
+      "const http = require('node:http');",
+      'const server = http.createServer(() => process.stdout.write(\'REQUEST\'));',
+      "server.on('upgrade', (req, socket, head) => {",
+      "  process.stdout.write('UPGRADE=' + req.url + ':' + String(head) + ':');",
+      "  socket.write('server-bytes');",
+      "  socket.on('data', (chunk) => process.stdout.write('CLIENT=' + String(chunk) + ':END'));",
+      '});',
+      "server.listen(8086, 'dusk.local');",
+      '',
+    ].join(' '));
+    await waitFor(() => relay.registrations.some(({ port }) => port === 8086));
+
+    const socket = new FakeRelaySocket();
+    relay.connect(socket, 'dusk.local', 8086);
+    socket.receive('GET /hmr HTTP/1.1\r\nHost: dusk.local\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nearly-bytes');
+
+    await waitFor(() => out.join('').includes('UPGRADE=/hmr:early-bytes:'));
+    expect(out.join('')).not.toContain('REQUEST');
+    expect(new TextDecoder().decode(concat(socket.sent))).toBe('server-bytes');
+
+    socket.receive('later-bytes');
+    await waitFor(() => out.join('').includes('CLIENT=later-bytes:END'));
   } finally {
     await repl.engine.terminate();
   }

@@ -1,6 +1,7 @@
 import { EventEmitter } from './node-events';
 import { Writable, Readable } from './node-stream';
 import { Socket, createConnection, Server as NetServer } from './node-net';
+import { createServer as createTlsServer, type Server as TlsServer } from './node-tls';
 import { HttpParser, type HttpHeadersInfo } from './http-parser';
 import { errnoError } from './node-errors';
 import { Buffer } from './node-buffer';
@@ -139,10 +140,15 @@ export class ServerResponse extends OutgoingMessage {
   statusCode = 200;
   statusMessage = '';
   sendDate = true;
+  private shouldKeepAlive: boolean;
+  private chunked = false;
+  private requestMethod: string;
 
-  constructor(socket: Socket) {
+  constructor(socket: Socket, shouldKeepAlive = true, requestMethod = 'GET') {
     super();
     this.socket = socket;
+    this.shouldKeepAlive = shouldKeepAlive;
+    this.requestMethod = requestMethod;
   }
 
   writeHead(status: number, statusMessageOrHeaders?: string | Record<string, string | string[]>, headers?: Record<string, string | string[]>): this {
@@ -159,10 +165,10 @@ export class ServerResponse extends OutgoingMessage {
   }
 
   override write(chunk: unknown, encOrCb?: string | ((err?: Error | null) => void), maybeCb?: (err?: Error | null) => void): boolean {
-    if (!this._headersSent) this._sendHeaders();
+    if (!this._headersSent) this._sendHeaders(true);
     const data = this._toBytes(chunk);
     if (!this.socket) return false;
-    this.socket.write(data);
+    this._writeBody(data);
     const cb = typeof encOrCb === 'function' ? encOrCb : maybeCb;
     if (cb) cb();
     return true;
@@ -175,27 +181,41 @@ export class ServerResponse extends OutgoingMessage {
           const data = this._toBytes(chunkOrCb);
           this.setHeader('Content-Length', String(data.length));
           this._sendHeaders();
-          if (this.socket) this.socket.write(data);
+          this._writeBody(data);
         } else {
           this._sendHeaders();
-          if (this.socket) this.socket.write(this._toBytes(chunkOrCb));
+          this._writeBody(this._toBytes(chunkOrCb));
         }
-      } else if (this.socket) {
-        this.socket.write(this._toBytes(chunkOrCb));
+      } else {
+        this._writeBody(this._toBytes(chunkOrCb));
       }
     } else if (!this._headersSent) {
+      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && this._contentLengthAllowed()) this.setHeader('Content-Length', '0');
       this._sendHeaders();
     }
+    if (this.chunked && this.socket && this._bodyAllowed()) this.socket.write(encodeUtf8('0\r\n\r\n'));
     this.finished = true;
     const cb = typeof chunkOrCb === 'function' ? chunkOrCb as () => void : (typeof encOrCb === 'function' ? encOrCb : maybeCb);
-    if (this.socket) this.socket.end();
+    if (this.socket && !this.shouldKeepAlive) this.socket.end();
     this.emit('finish');
     if (cb) cb();
     return this;
   }
 
-  private _sendHeaders(): void {
+  private _sendHeaders(streaming = false): void {
     if (this._headersSent || !this.socket) return;
+    if (!this.shouldKeepAlive) {
+      this.removeHeader('connection');
+      this.setHeader('Connection', 'close');
+    }
+    if (!this._bodyAllowed()) {
+      this.removeHeader('transfer-encoding');
+      if (!this._contentLengthAllowed()) this.removeHeader('content-length');
+    } else if (streaming && !this.hasHeader('content-length') && !this.hasHeader('transfer-encoding')) {
+      this.setHeader('Transfer-Encoding', 'chunked');
+    }
+    const transferEncoding = this.getHeader('transfer-encoding');
+    this.chunked = transferEncoding !== undefined && /(?:^|,)\s*chunked\s*(?:,|$)/i.test(Array.isArray(transferEncoding) ? transferEncoding.join(',') : transferEncoding);
     this._headersSent = true;
     const msg = this.statusMessage || STATUS_CODES[this.statusCode] || '';
     let head = `HTTP/1.1 ${this.statusCode} ${msg}\r\n`;
@@ -203,6 +223,25 @@ export class ServerResponse extends OutgoingMessage {
     head += HeaderMethods.formatHeaders(this._headers);
     head += '\r\n';
     this.socket.write(encodeUtf8(head));
+  }
+
+  private _writeBody(data: Uint8Array): void {
+    if (!this.socket || !this._bodyAllowed()) return;
+    if (this.chunked) {
+      this.socket.write(encodeUtf8(`${data.length.toString(16)}\r\n`));
+      this.socket.write(data);
+      this.socket.write(encodeUtf8('\r\n'));
+      return;
+    }
+    this.socket.write(data);
+  }
+
+  private _bodyAllowed(): boolean {
+    return this.requestMethod !== 'HEAD' && this.statusCode !== 204 && this.statusCode !== 304 && (this.statusCode < 100 || this.statusCode >= 200);
+  }
+
+  private _contentLengthAllowed(): boolean {
+    return this.statusCode !== 204 && (this.statusCode < 100 || this.statusCode >= 200);
   }
 
   private _toBytes(chunk: unknown): Uint8Array {
@@ -226,9 +265,9 @@ export class ClientRequest extends OutgoingMessage {
     super();
     this.method = (opts.method ?? 'GET').toUpperCase();
     this.host = opts.host ?? opts.hostname ?? '127.0.0.1';
-    this.port = opts.port ?? 80;
     this.path = opts.path ?? '/';
     this.protocol = opts.protocol ?? 'http:';
+    this.port = opts.port ?? (this.protocol === 'https:' ? 443 : 80);
     if (opts.headers) for (const [k, v] of Object.entries(opts.headers)) this._headers[k] = v as string;
     if (!this.hasHeader('host')) this.setHeader('Host', this.host + (this.port !== 80 && this.port !== 443 ? ':' + this.port : ''));
     if (cb) this.once('response', cb as unknown as (...args: unknown[]) => void);
@@ -385,6 +424,36 @@ export interface RequestOptions {
   protocol?: string;
   headers?: Record<string, string | string[]>;
   agent?: unknown;
+  ca?: unknown;
+  cert?: unknown;
+  key?: unknown;
+  pfx?: unknown;
+  passphrase?: unknown;
+  crl?: unknown;
+  rejectUnauthorized?: boolean;
+  servername?: string;
+  secureContext?: unknown;
+  minVersion?: unknown;
+  maxVersion?: unknown;
+  secureProtocol?: unknown;
+  secureOptions?: unknown;
+  sigalgs?: unknown;
+  ecdhCurve?: unknown;
+  ALPNProtocols?: unknown;
+  session?: unknown;
+  enableTrace?: unknown;
+  minDHSize?: unknown;
+  clientCertEngine?: unknown;
+  privateKeyEngine?: unknown;
+  privateKeyIdentifier?: unknown;
+  requestOCSP?: unknown;
+  allowPartialTrustChain?: unknown;
+  checkServerIdentity?: unknown;
+  pskCallback?: unknown;
+  ALPNCallback?: unknown;
+  SNICallback?: unknown;
+  keylog?: unknown;
+  ciphers?: unknown;
   timeout?: number;
 }
 
@@ -432,10 +501,11 @@ export class Server extends EventEmitter {
     return this;
   }
 
-  private _onConnection(socket: Socket): void {
+  _onConnection(socket: Socket): void {
     const parser = new HttpParser('REQUEST');
     let req: IncomingMessage | null = null;
     let res: ServerResponse | null = null;
+    let upgradeReq: IncomingMessage | null = null;
 
     parser.onHeadersComplete = (info: HttpHeadersInfo) => {
       req = new IncomingMessage(socket);
@@ -448,7 +518,11 @@ export class Server extends EventEmitter {
       for (let i = 0; i + 1 < info.headers.length; i += 2) {
         req.headers[info.headers[i]!.toLowerCase()] = info.headers[i + 1]!;
       }
-      res = new ServerResponse(socket);
+      if (info.upgrade) {
+        upgradeReq = req;
+        return 2;
+      }
+      res = new ServerResponse(socket, info.shouldKeepAlive, info.method);
       this.emit('request', req, res);
     };
     parser.onBody = (chunk) => { if (req) req.push(Buffer.from(chunk)); };
@@ -457,7 +531,12 @@ export class Server extends EventEmitter {
 
     socket.on('data', (...args) => {
       const buf = args[0];
-      if (buf instanceof Uint8Array) parser.execute(buf);
+      if (!(buf instanceof Uint8Array) || upgradeReq) return;
+      parser.execute(buf);
+      if (upgradeReq) {
+        const handled = this.emit('upgrade', upgradeReq, socket, Buffer.from(parser.takeRemaining()));
+        if (!handled) socket.destroy();
+      }
     });
     socket.on('end', () => parser.finish());
     socket.on('error', (...args) => this.emit('clientError', args[0], socket));
@@ -466,6 +545,24 @@ export class Server extends EventEmitter {
 
 export const createServer = (opts?: unknown, listener?: (req: IncomingMessage, res: ServerResponse) => void): Server => {
   return new Server(opts, listener);
+};
+
+const HTTPS_UNSUPPORTED_OPTIONS = [
+  'ca', 'cert', 'key', 'pfx', 'passphrase', 'crl', 'rejectUnauthorized', 'servername', 'secureContext',
+  'minVersion', 'maxVersion', 'secureProtocol', 'secureOptions', 'sigalgs', 'ecdhCurve',
+  'ALPNProtocols', 'session', 'enableTrace', 'minDHSize', 'clientCertEngine', 'privateKeyEngine', 'privateKeyIdentifier',
+  'requestOCSP', 'allowPartialTrustChain',
+  'checkServerIdentity', 'pskCallback', 'ALPNCallback', 'SNICallback', 'keylog', 'ciphers',
+] as const;
+
+const assertBrowserHttpsOptions = (opts: RequestOptions, isHttps = opts.protocol === 'https:'): void => {
+  if (!isHttps) return;
+  for (const name of HTTPS_UNSUPPORTED_OPTIONS) {
+    if (opts[name] !== undefined) throw new Error(`browser HTTPS does not support ${name}`);
+  }
+  if (opts.agent != null && opts.agent !== false && opts.agent !== globalAgent) {
+    throw new Error('browser HTTPS does not support agent');
+  }
 };
 
 export const request = (urlOrOpts: string | RequestOptions, optsOrCb?: RequestOptions | ((res: IncomingMessage) => void), maybeCb?: (res: IncomingMessage) => void): ClientRequest => {
@@ -486,6 +583,7 @@ export const request = (urlOrOpts: string | RequestOptions, optsOrCb?: RequestOp
     opts = urlOrOpts;
     if (typeof optsOrCb === 'function') cb = optsOrCb;
   }
+  assertBrowserHttpsOptions(opts);
   const req = new ClientRequest(opts, cb);
   return req;
 };
@@ -494,6 +592,37 @@ export const get = (urlOrOpts: string | RequestOptions, optsOrCb?: RequestOption
   const req = request(urlOrOpts, optsOrCb, maybeCb);
   req.end();
   return req;
+};
+
+const httpsRequest = (urlOrOpts: string | URL | RequestOptions, optsOrCb?: RequestOptions | ((res: IncomingMessage) => void), maybeCb?: (res: IncomingMessage) => void): ClientRequest => {
+  if (typeof urlOrOpts === 'string' || urlOrOpts instanceof URL) {
+    if (typeof optsOrCb === 'object' && optsOrCb !== null) assertBrowserHttpsOptions(optsOrCb, true);
+    return request(String(urlOrOpts), optsOrCb, maybeCb);
+  }
+  const opts = { ...urlOrOpts, protocol: urlOrOpts.protocol ?? 'https:' };
+  assertBrowserHttpsOptions(opts, true);
+  return request(opts, optsOrCb, maybeCb);
+};
+
+const httpsGet = (urlOrOpts: string | URL | RequestOptions, optsOrCb?: RequestOptions | ((res: IncomingMessage) => void), maybeCb?: (res: IncomingMessage) => void): ClientRequest => {
+  const req = httpsRequest(urlOrOpts, optsOrCb, maybeCb);
+  req.end();
+  return req;
+};
+
+const httpsCreateServer = (opts?: unknown, listener?: (req: IncomingMessage, res: ServerResponse) => void): TlsServer => {
+  let tls: TlsServer;
+  try {
+    tls = createTlsServer(opts as { cert: string | Uint8Array; key: string | Uint8Array });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'browser TLS does not support TLS servers') {
+      throw new Error('browser HTTPS does not support TLS servers');
+    }
+    throw error;
+  }
+  const http = new Server({}, listener);
+  tls.on('connection', (socket) => http._onConnection(socket as Socket));
+  return tls;
 };
 
 export class Agent {
@@ -521,4 +650,11 @@ export const nodeHttp = {
   createServer,
   request,
   get,
+};
+
+export const nodeHttps = {
+  ...nodeHttp,
+  createServer: httpsCreateServer,
+  request: httpsRequest,
+  get: httpsGet,
 };

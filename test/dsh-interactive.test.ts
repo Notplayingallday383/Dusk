@@ -4,6 +4,7 @@
 
 import { test, expect } from 'vitest';
 import { bootRepl } from '../src/index';
+import type { FSBackend } from '../src/host/fs-backend';
 
 const decode = (bytes: Uint8Array): string => {
   let s = '';
@@ -22,7 +23,11 @@ const pump = async (stream: ReadableStream<Uint8Array>, into: (s: string) => voi
   } catch { /* */ }
 };
 
-const startJsh = async (): Promise<{
+const startJsh = async (options: {
+  cwd?: string;
+  path?: string;
+  setup?: (fs: FSBackend) => Promise<void>;
+} = {}): Promise<{
   repl: Awaited<ReturnType<typeof bootRepl>>;
   sh: Awaited<ReturnType<Awaited<ReturnType<typeof bootRepl>>['processManager']['spawn']>>;
   stdoutBuf: () => string;
@@ -32,11 +37,15 @@ const startJsh = async (): Promise<{
 }> => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  if (options.setup) {
+    await options.setup((repl.processManager as unknown as { fs: FSBackend }).fs);
+  }
   const sh = await repl.processManager.spawn('/bin/dsh', [], {
-    cwd: '/', env: { PATH: '/bin' }, pty: { cols: 80, rows: 24 },
+    cwd: options.cwd ?? '/', env: { PATH: options.path ?? '/bin' }, pty: { cols: 80, rows: 24 },
   });
   let buf = '';
   void pump(sh.stdout, (s) => { buf += s; });
+  void pump(sh.stderr, (s) => { buf += s; });
   const encoder = new TextEncoder();
   const waitFor = async (marker: string, deadlineMs = 5000): Promise<boolean> => {
     const deadline = Date.now() + deadlineMs;
@@ -130,6 +139,84 @@ test('dsh interactive: reads DuskJS-seeded /etc/hostname', async () => {
   // content between them. Look for "duskjs" or similar hostname content.
   const promptCount = (buf.match(/dsh\$ /g) ?? []).length;
   expect(promptCount).toBeGreaterThanOrEqual(2);
+  await j.cleanup();
+}, 60_000);
+
+test('dsh interactive: project node_modules bin tar runs before browser exclusion', async () => {
+  const j = await startJsh({
+    cwd: '/project',
+    setup: async (fs) => {
+      await fs.mkdir('/project/node_modules/.bin', { recursive: true });
+      await fs.writeFile('/project/node_modules/.bin/tar', 'echo project-tar\n');
+    },
+  });
+  await j.waitFor('dsh$ ');
+  await j.send('tar');
+  expect(await j.waitFor('project-tar')).toBe(true);
+  expect(j.stdoutBuf()).not.toContain('command not available in browser environments');
+  await j.cleanup();
+}, 60_000);
+
+test('dsh interactive: ancestor node_modules bin remains first after cd into a nested cwd', async () => {
+  const j = await startJsh({
+    cwd: '/home/dusk',
+    setup: async (fs) => {
+      await fs.mkdir('/home/dusk/node_modules/.bin', { recursive: true });
+      await fs.mkdir('/home/dusk/test3', { recursive: true });
+      await fs.writeFile('/home/dusk/node_modules/.bin/tar', 'echo ancestor-tar\n');
+    },
+  });
+  await j.waitFor('dsh$ ');
+  await j.send('cd /home/dusk/test3');
+  await j.send('which tar');
+  expect(await j.waitFor('/home/dusk/node_modules/.bin/tar')).toBe(true);
+  await j.send('tar');
+  expect(await j.waitFor('ancestor-tar')).toBe(true);
+  await j.send('which zip || echo zip-not-found');
+  expect(await j.waitFor('zip-not-found')).toBe(true);
+  await j.send('which unzip || echo unzip-not-found');
+  expect(await j.waitFor('unzip-not-found')).toBe(true);
+  expect(j.stdoutBuf()).not.toContain('command not available in browser environments');
+  await j.cleanup();
+}, 60_000);
+
+test('dsh interactive: DPM /usr/bin tar shim runs before browser exclusion', async () => {
+  const j = await startJsh({
+    path: '/usr/bin:/bin',
+    setup: async (fs) => {
+      await fs.mkdir('/usr/bin', { recursive: true });
+      await fs.writeFile('/usr/bin/tar', 'echo dpm-tar\n');
+    },
+  });
+  await j.waitFor('dsh$ ');
+  await j.send('tar');
+  expect(await j.waitFor('dpm-tar')).toBe(true);
+  expect(j.stdoutBuf()).not.toContain('command not available in browser environments');
+  await j.cleanup();
+}, 60_000);
+
+test('dsh interactive: absent tar emits the unsupported command message', async () => {
+  const j = await startJsh({ path: '/usr/bin:/bin' });
+  await j.waitFor('dsh$ ');
+  await j.send('tar');
+  expect(await j.waitFor('tar: not supported in DuskJS engine')).toBe(true);
+  await j.cleanup();
+}, 60_000);
+
+test('dsh interactive: shell builtin cd remains ahead of a project bin shim', async () => {
+  const j = await startJsh({
+    cwd: '/project',
+    setup: async (fs) => {
+      await fs.mkdir('/project/node_modules/.bin', { recursive: true });
+      await fs.mkdir('/target', { recursive: true });
+      await fs.writeFile('/project/node_modules/.bin/cd', 'echo shim-cd\n');
+    },
+  });
+  await j.waitFor('dsh$ ');
+  await j.send('cd /target');
+  await j.send('pwd');
+  expect(await j.waitFor('/target')).toBe(true);
+  expect(j.stdoutBuf()).not.toContain('shim-cd');
   await j.cleanup();
 }, 60_000);
 

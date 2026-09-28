@@ -1,4 +1,4 @@
-import type { FSBackend, FSCaller, FSStat, FSReadResult, FSWriteResult, FSFstat } from './fs-backend';
+import type { FSBackend, FSCaller, FSMutation, FSStat, FSReadResult, FSWriteResult, FSFstat } from './fs-backend';
 import type { ProcessManager } from './process-manager';
 import { norm, encodeUtf8 } from './vfs';
 
@@ -22,6 +22,7 @@ const syntheticByteStubs = <B extends { readFile(path: string, caller?: FSCaller
   fstatHandle: async (): Promise<FSFstat> => { throw enosys('fstatHandle'); },
   ftruncateHandle: async (): Promise<void> => { throw enosys('ftruncateHandle'); },
   fsyncHandle: async (): Promise<void> => { throw enosys('fsyncHandle'); },
+  subscribe: (): (() => void) => () => {},
 });
 
 export interface LayoutOptions {
@@ -50,6 +51,16 @@ const exdev = (from: string, to: string): Error => {
   return e;
 };
 
+const staticStat = (isFile: boolean, isDirectory: boolean): FSStat => ({
+  isFile,
+  isDirectory,
+  size: 0,
+  mtimeMs: 0,
+  atimeMs: 0,
+  ctimeMs: 0,
+  birthtimeMs: 0,
+});
+
 const enotDir = (path: string): Error => {
   const e = new Error(`ENOTDIR: not a directory, '${path}'`);
   (e as Error & { code?: string }).code = 'ENOTDIR';
@@ -60,6 +71,7 @@ interface MountResolver {
   match(path: string): boolean;
   backend: FSBackend;
   prefix: string;
+  backendPrefix: string;
 }
 
 const stripPrefix = (path: string, prefix: string): string => {
@@ -67,6 +79,11 @@ const stripPrefix = (path: string, prefix: string): string => {
   if (path.startsWith(prefix + '/')) return path.slice(prefix.length);
   return path;
 };
+
+const pathForMount = (path: string, mount: MountResolver): string =>
+  mount.backendPrefix === '/'
+    ? stripPrefix(path, mount.prefix)
+    : norm(mount.backendPrefix + stripPrefix(path, mount.prefix));
 
 const buildSyntheticBin = (pm: ProcessManager): FSBackend => {
   const fileFor = async (name: string): Promise<string | undefined> => {
@@ -101,9 +118,9 @@ const buildSyntheticBin = (pm: ProcessManager): FSBackend => {
     },
     async stat(path: string): Promise<FSStat> {
       const n = norm(path);
-      if (n === '/' || n === '') return { isFile: false, isDirectory: true };
+      if (n === '/' || n === '') return staticStat(false, true);
       const name = '/bin' + n;
-      if (pm.hasBinary(name)) return { isFile: true, isDirectory: false };
+      if (pm.hasBinary(name)) return staticStat(true, false);
       throw enotEnt(path);
     },
     async rename(from: string): Promise<void> { throw erofs(from); },
@@ -176,21 +193,21 @@ const buildSyntheticProc = (pm: ProcessManager): FSBackend => {
     async stat(path: string, caller?: FSCaller): Promise<FSStat> {
       const n = norm(path);
       const me = callerPid(caller);
-      if (n === '/' || n === '') return { isFile: false, isDirectory: true };
-      if (n === '/cpuinfo' || n === '/meminfo' || n === '/uptime') return { isFile: true, isDirectory: false };
-      if (n === '/self') return { isFile: false, isDirectory: true };
+      if (n === '/' || n === '') return staticStat(false, true);
+      if (n === '/cpuinfo' || n === '/meminfo' || n === '/uptime') return staticStat(true, false);
+      if (n === '/self') return staticStat(false, true);
       const selfMatch = /^\/self\/(.+)$/.exec(n);
       const pidMatch = /^\/(\d+)(?:\/(.+))?$/.exec(n);
       if (selfMatch) {
         const rec = recordFor(me);
         if (!rec) throw enotEnt(path);
-        return { isFile: true, isDirectory: false };
+        return staticStat(true, false);
       }
       if (pidMatch) {
         const pid = parseInt(pidMatch[1]!, 10);
         const rec = recordFor(pid);
         if (!rec) throw enotEnt(path);
-        return pidMatch[2] ? { isFile: true, isDirectory: false } : { isFile: false, isDirectory: true };
+        return pidMatch[2] ? staticStat(true, false) : staticStat(false, true);
       }
       throw enotEnt(path);
     },
@@ -239,8 +256,8 @@ const buildSyntheticDev = (): FSBackend => {
     },
     async stat(path: string): Promise<FSStat> {
       const n = norm(path);
-      if (n === '/' || n === '') return { isFile: false, isDirectory: true };
-      if (knownNames.has(n.replace(/^\//, ''))) return { isFile: true, isDirectory: false };
+      if (n === '/' || n === '') return staticStat(false, true);
+      if (knownNames.has(n.replace(/^\//, ''))) return staticStat(true, false);
       throw enotEnt(path);
     },
     async rename(from: string): Promise<void> { throw erofs(from); },
@@ -251,6 +268,7 @@ const buildSyntheticDev = (): FSBackend => {
 export const createLayoutBackend = async (opts: LayoutOptions): Promise<FSBackend> => {
   const { ephemeral, persistent, processManager: pm, user, hostname } = opts;
   const homeMount = `/home/${user}`;
+  const projectMount = '/project';
 
   // Seed ephemeral /etc
   const etcSeeds: Record<string, string> = {
@@ -267,16 +285,18 @@ export const createLayoutBackend = async (opts: LayoutOptions): Promise<FSBacken
   for (const d of ['/tmp', '/root', '/var', '/home']) {
     if (!(await ephemeral.exists(d))) await ephemeral.mkdir(d);
   }
+  if (!(await persistent.exists(projectMount))) await persistent.mkdir(projectMount);
 
   const syntheticBin = buildSyntheticBin(pm);
   const syntheticProc = buildSyntheticProc(pm);
   const syntheticDev = buildSyntheticDev();
 
   const mounts: MountResolver[] = [
-    { prefix: '/bin', backend: syntheticBin, match: (p) => p === '/bin' || p.startsWith('/bin/') },
-    { prefix: '/proc', backend: syntheticProc, match: (p) => p === '/proc' || p.startsWith('/proc/') },
-    { prefix: '/dev', backend: syntheticDev, match: (p) => p === '/dev' || p.startsWith('/dev/') },
-    { prefix: homeMount, backend: persistent, match: (p) => p === homeMount || p.startsWith(homeMount + '/') },
+    { prefix: '/bin', backend: syntheticBin, backendPrefix: '/', match: (p) => p === '/bin' || p.startsWith('/bin/') },
+    { prefix: '/proc', backend: syntheticProc, backendPrefix: '/', match: (p) => p === '/proc' || p.startsWith('/proc/') },
+    { prefix: '/dev', backend: syntheticDev, backendPrefix: '/', match: (p) => p === '/dev' || p.startsWith('/dev/') },
+    { prefix: homeMount, backend: persistent, backendPrefix: '/', match: (p) => p === homeMount || p.startsWith(homeMount + '/') },
+    { prefix: projectMount, backend: persistent, backendPrefix: projectMount, match: (p) => p === projectMount || p.startsWith(projectMount + '/') },
   ];
 
   const pickMount = (path: string): MountResolver | null => {
@@ -284,50 +304,84 @@ export const createLayoutBackend = async (opts: LayoutOptions): Promise<FSBacken
     return null;
   };
 
+  // Backend handle IDs are local, so expose layout-owned IDs and retain where each
+  // one originated for all subsequent handle operations.
+  let persistentEventMount: MountResolver | undefined;
+  const withPersistentEventMount = async <T>(mount: MountResolver | null, operation: () => Promise<T>): Promise<T> => {
+    const previous = persistentEventMount;
+    if (mount?.backend === persistent) persistentEventMount = mount;
+    try { return await operation(); } finally { persistentEventMount = previous; }
+  };
+  const handles = new Map<number, { backend: FSBackend; handle: number; mount: MountResolver | null }>();
+  let nextHandle = 1;
+  const targetForHandle = (handle: number): { backend: FSBackend; handle: number; mount: MountResolver | null } =>
+    handles.get(handle) ?? { backend: ephemeral, handle, mount: null };
+
   const layout: FSBackend = {
+    subscribe(listener) {
+      const notify = (event: FSMutation): void => {
+        try { listener(event); } catch { /* Listeners cannot invalidate completed mutations. */ }
+      };
+      const persistentMounts = mounts.filter((mount) => mount.backend === persistent);
+      const persistentMountFor = (path: string): MountResolver =>
+        persistentMounts
+          .filter((mount) => mount.backendPrefix === '/' || path === mount.backendPrefix || path.startsWith(mount.backendPrefix + '/'))
+          .sort((a, b) => b.backendPrefix.length - a.backendPrefix.length)[0] ?? persistentMounts[0]!;
+      const forwardPersistent = (event: FSMutation): void => {
+        const mount = persistentEventMount ?? persistentMountFor(event.path);
+        const translated = { ...event, path: mount.prefix + stripPrefix(event.path, mount.backendPrefix) };
+        if (event.previousPath !== undefined) translated.previousPath = mount.prefix + stripPrefix(event.previousPath, mount.backendPrefix);
+        notify(translated);
+      };
+      const unsubscribes = [
+        ephemeral.subscribe(notify),
+        persistent.subscribe(forwardPersistent),
+      ];
+      return () => { for (const unsubscribe of unsubscribes) unsubscribe(); };
+    },
     async readFile(path, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.readFile(stripPrefix(n, m.prefix), caller);
+      if (m) return m.backend.readFile(pathForMount(n, m), caller);
       return ephemeral.readFile(n, caller);
     },
     async writeFile(path, data, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.writeFile(stripPrefix(n, m.prefix), data, caller);
+      if (m) return withPersistentEventMount(m, () => m.backend.writeFile(pathForMount(n, m), data, caller));
       return ephemeral.writeFile(n, data, caller);
     },
     async readdir(path, caller) {
       const n = norm(path);
       if (n === '/home') return [user];
       const m = pickMount(n);
-      if (m) return m.backend.readdir(stripPrefix(n, m.prefix), caller);
+      if (m) return m.backend.readdir(pathForMount(n, m), caller);
       return ephemeral.readdir(n, caller);
     },
     async mkdir(path, options, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.mkdir(stripPrefix(n, m.prefix), options, caller);
+      if (m) return withPersistentEventMount(m, () => m.backend.mkdir(pathForMount(n, m), options, caller));
       return ephemeral.mkdir(n, options, caller);
     },
     async rm(path, options, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.rm(stripPrefix(n, m.prefix), options, caller);
+      if (m) return withPersistentEventMount(m, () => m.backend.rm(pathForMount(n, m), options, caller));
       return ephemeral.rm(n, options, caller);
     },
     async exists(path, caller) {
       const n = norm(path);
       if (n === '/home') return true;
       const m = pickMount(n);
-      if (m) return m.backend.exists(stripPrefix(n, m.prefix), caller);
+      if (m) return m.backend.exists(pathForMount(n, m), caller);
       return ephemeral.exists(n, caller);
     },
     async stat(path, caller) {
       const n = norm(path);
-      if (n === '/home') return { isFile: false, isDirectory: true };
+      if (n === '/home') return staticStat(false, true);
       const m = pickMount(n);
-      if (m) return m.backend.stat(stripPrefix(n, m.prefix), caller);
+      if (m) return m.backend.stat(pathForMount(n, m), caller);
       return ephemeral.stat(n, caller);
     },
     async rename(from, to, caller) {
@@ -336,49 +390,54 @@ export const createLayoutBackend = async (opts: LayoutOptions): Promise<FSBacken
       const fm = pickMount(f);
       const tm = pickMount(t);
       if ((fm?.prefix ?? '') !== (tm?.prefix ?? '')) throw exdev(from, to);
-      if (fm) return fm.backend.rename(stripPrefix(f, fm.prefix), stripPrefix(t, fm.prefix), caller);
+      if (fm) return withPersistentEventMount(fm, () => fm.backend.rename(pathForMount(f, fm), pathForMount(t, fm), caller));
       return ephemeral.rename(f, t, caller);
     },
     async readFileBytes(path, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.readFileBytes(stripPrefix(n, m.prefix), caller);
+      if (m) return m.backend.readFileBytes(pathForMount(n, m), caller);
       return ephemeral.readFileBytes(n, caller);
     },
     async writeFileBytes(path, data, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.writeFileBytes(stripPrefix(n, m.prefix), data, caller);
+      if (m) return withPersistentEventMount(m, () => m.backend.writeFileBytes(pathForMount(n, m), data, caller));
       return ephemeral.writeFileBytes(n, data, caller);
     },
     async openHandle(path, flags, caller) {
       const n = norm(path);
       const m = pickMount(n);
-      if (m) return m.backend.openHandle(stripPrefix(n, m.prefix), flags, caller);
-      return ephemeral.openHandle(n, flags, caller);
+      const backend = m?.backend ?? ephemeral;
+      const opened = await withPersistentEventMount(m, () => backend.openHandle(m ? pathForMount(n, m) : n, flags, caller));
+      const handle = nextHandle++;
+      handles.set(handle, { backend, handle: opened.handle, mount: m });
+      return { ...opened, handle };
     },
-    // Handle ops route to the ephemeral backend only. Synthetic mounts don't hand
-    // out handles (their openHandle throws ENOSYS), so any handle we see here came
-    // from the ephemeral backend and must be routed there. Callers using layout
-    // still get single-backend semantics per-handle; cross-backend handle sharing
-    // is not supported.
     async readHandle(handle, length, position, caller) {
-      return ephemeral.readHandle(handle, length, position, caller);
+      const target = targetForHandle(handle);
+      return target.backend.readHandle(target.handle, length, position, caller);
     },
     async writeHandle(handle, data, position, caller) {
-      return ephemeral.writeHandle(handle, data, position, caller);
+      const target = targetForHandle(handle);
+      return withPersistentEventMount(target.mount, () => target.backend.writeHandle(target.handle, data, position, caller));
     },
     async closeHandle(handle, caller) {
-      return ephemeral.closeHandle(handle, caller);
+      const target = targetForHandle(handle);
+      await withPersistentEventMount(target.mount, () => target.backend.closeHandle(target.handle, caller));
+      handles.delete(handle);
     },
     async fstatHandle(handle, caller) {
-      return ephemeral.fstatHandle(handle, caller);
+      const target = targetForHandle(handle);
+      return target.backend.fstatHandle(target.handle, caller);
     },
     async ftruncateHandle(handle, length, caller) {
-      return ephemeral.ftruncateHandle(handle, length, caller);
+      const target = targetForHandle(handle);
+      return withPersistentEventMount(target.mount, () => target.backend.ftruncateHandle(target.handle, length, caller));
     },
     async fsyncHandle(handle, caller) {
-      return ephemeral.fsyncHandle(handle, caller);
+      const target = targetForHandle(handle);
+      return withPersistentEventMount(target.mount, () => target.backend.fsyncHandle(target.handle, caller));
     },
   };
 

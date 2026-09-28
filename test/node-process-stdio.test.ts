@@ -36,3 +36,17 @@ test('REPL process.stderr is a Writable and delivers writes to the host sink', a
   expect(text).toContain('err2');
   expect(text).toContain('stderr-is-writable=true');
 }, 60_000);
+
+test('spawned process.stdin exposes EventEmitter listeners', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
+
+  try {
+    const process = await repl.processManager.spawn('/bin/node', ['-e', "process.stdin.on('data', () => {}); process.stdout.write('ready');"]);
+    const reader = process.stdout.getReader();
+    const output = await reader.read();
+    expect(new TextDecoder().decode(output.value)).toBe('ready');
+    await expect(process.exit).resolves.toBe(0);
+  } finally {
+    await repl.engine.terminate();
+  }
+}, 60_000);

@@ -1,4 +1,7 @@
 import { bootRepl } from '../index';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import { TRANSCRIPT_SEED } from './transcript';
 import { walkOpfs, clearOpfs } from './opfs-view';
 import type { LibCurl } from '../host/net';
@@ -7,7 +10,7 @@ const loadRealLibcurl = async (): Promise<LibCurl> => {
   // Use Nova (Rust wisp client) as libcurl.js's drop-in replacement.
   // Nova exposes a `LibCurl`-shaped class that satisfies DuskJS's
   // `LibCurl` interface (see src/host/net.ts:9-25).
-  const nova = await import('nova-wasm');
+  const nova = await import('@nightnetwork/nova');
   await nova.default(); // wasm-bindgen init — loads the WASM binary
   return new nova.LibCurl() as unknown as LibCurl;
 };
@@ -71,28 +74,6 @@ const NODE_EXAMPLES: string[] = [
   // Meta: reset context, then exit back to dsh
   '.clear',
   '.exit',
-];
-
-// sqlite3 (dsh built-in via sql.js on the host). Each entry runs as a
-// standalone dsh command — sqlite3 exits after each invocation, so state
-// only persists across calls if you write to a TFS path (not :memory:).
-const SQLITE_EXAMPLES: string[] = [
-  // Simple arithmetic
-  'sqlite3 :memory: "SELECT 2 + 2"',
-  // Column headers + type coercion
-  'sqlite3 -header :memory: "SELECT 1 AS id, \'alice\' AS name"',
-  // JSON output
-  'sqlite3 -json :memory: "SELECT 42 AS x, \'y\' AS s"',
-  // Create a persistent DB file in TFS
-  'sqlite3 /tmp/demo.db "CREATE TABLE IF NOT EXISTS t(id INTEGER, name TEXT)"',
-  'sqlite3 /tmp/demo.db "INSERT INTO t VALUES (1,\'dusk\'),(2,\'shell\')"',
-  'sqlite3 -header -column /tmp/demo.db "SELECT * FROM t"',
-  // Cross-tool: same DB via /bin/sqlite3 REPL (once you open it, dsh is bypassed)
-  // No REPL button here — the sqlite3 command in dsh is one-shot only.
-  // Aggregation
-  'sqlite3 /tmp/demo.db "SELECT COUNT(*) AS n FROM t"',
-  // Piped SQL via stdin
-  'echo "SELECT sqlite_version()" | sqlite3 :memory:',
 ];
 
 // node:crypto examples for the Node REPL. Run `node` first to enter the
@@ -193,20 +174,19 @@ const PYTHON_EXAMPLES: string[] = [
 ];
 
 export const startPage = async (): Promise<void> => {
-  const out = document.getElementById('out') as HTMLPreElement;
-  const line = document.getElementById('line') as HTMLInputElement;
+  const terminalHost = document.getElementById('terminal') as HTMLDivElement;
   const examples = document.getElementById('examples') as HTMLDivElement;
   const nodeExamples = document.getElementById('node-examples') as HTMLDivElement;
   const cryptoExamples = document.getElementById('crypto-examples') as HTMLDivElement;
-  const sqliteExamples = document.getElementById('sqlite-examples') as HTMLDivElement;
   const pythonExamples = document.getElementById('python-examples') as HTMLDivElement;
   const fsview = document.getElementById('fsview') as HTMLPreElement;
   const clearfs = document.getElementById('clearfs') as HTMLButtonElement;
 
-  const write = (text: string): void => {
-    out.textContent += text;
-    out.scrollTop = out.scrollHeight;
-  };
+  const terminal = new Terminal({ cols: 80, rows: 24, cursorBlink: true, convertEol: true, scrollback: 5_000 });
+  const fitAddon = new FitAddon();
+  terminal.loadAddon(fitAddon);
+  terminal.open(terminalHost);
+  const write = (text: string): void => terminal.write(text);
 
   const refreshFsView = async (): Promise<void> => {
     try { fsview.textContent = await walkOpfs(); }
@@ -217,20 +197,29 @@ export const startPage = async (): Promise<void> => {
 
   write('booting DuskJS...\n');
   const repl = await bootRepl(write, {
-    net: { loadLibcurl: loadRealLibcurl, proxyUrl: 'wss://gointospace.app/wisp/' },
+    net: { loadLibcurl: loadRealLibcurl, proxyUrl: 'wss://gointospace.app/wisp/', tcp: true },
     seed: TRANSCRIPT_SEED,
+    user: 'dusk',
     // The demo drives dsh directly via stdin (no `feed()` calls), so the
-    // pid-0 engine that bootRepl would otherwise create is dead weight —
-    // it's a whole SpiderMonkey Worker (~100MB) that just sits idle.
-    // Skipping it roughly halves the demo's steady-state memory footprint.
+    // pid-0 engine that bootRepl would otherwise create is dead weight: the
+    // demo drives dsh directly and never calls feed(). Skipping it avoids an
+    // idle runtime Worker and reduces steady-state memory use.
     skipPidZero: true,
   });
   write('spawning /bin/dsh (interactive)...\n');
   const sh = await repl.processManager.spawn('/bin/dsh', [], {
-    cwd: '/root',
-    env: { HOME: '/root', PATH: '/usr/local/bin:/usr/bin:/bin', TERM: 'xterm-256color', USER: 'dusk' },
+    // The layout persists only /home/<user>; /root and /tmp are session-only.
+    cwd: '/home/dusk',
+    env: { HOME: '/home/dusk', PATH: '/usr/local/bin:/usr/bin:/bin', TERM: 'xterm-256color', USER: 'dusk', DPM_REGISTRY: 'https://registry.dusk.night-x.com/' },
     pty: { cols: 80, rows: 24 },
   });
+
+  const resize = (): void => {
+    fitAddon.fit();
+    sh.master?.resize(terminal.cols, terminal.rows);
+  };
+  window.addEventListener('resize', resize);
+  resize();
 
   // With a PTY attached, master's onMasterData already carries BOTH the
   // process's stdout/stderr (via slaveWrite) AND the line-discipline echo of
@@ -250,23 +239,29 @@ export const startPage = async (): Promise<void> => {
   void drain(sh.stdout);
   void drain(sh.stderr);
 
-  void sh.exit.then((code) => write('\n[shell exited with code ' + String(code) + ']\n'));
+  let disposed = false;
+  const teardown = (): void => {
+    if (disposed) return;
+    disposed = true;
+    window.removeEventListener('resize', resize);
+    terminal.dispose();
+  };
+  window.addEventListener('beforeunload', teardown, { once: true });
+  void sh.exit.then((code) => {
+    write('\n[shell exited with code ' + String(code) + ']\n');
+    teardown();
+  });
 
   write('ready. (fs is persistent via TFS/OPFS)\n');
   await refreshFsView();
 
   const encoder = new TextEncoder();
   const submit = async (text: string): Promise<void> => {
-    await sh.stdin.write(encoder.encode(text + '\n'));
-    await refreshFsView();
+    await sh.stdin.write(encoder.encode(text.replace(/\r/g, '\n')));
+    if (text.includes('\r') || text.includes('\n')) await refreshFsView();
   };
 
-  line.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key !== 'Enter') return;
-    const text = line.value;
-    line.value = '';
-    void submit(text);
-  });
+  terminal.onData((data) => { void submit(data); });
 
   clearfs.addEventListener('click', () => {
     void (async () => {
@@ -278,7 +273,7 @@ export const startPage = async (): Promise<void> => {
   for (const ex of SHELL_EXAMPLES) {
     const btn = document.createElement('button');
     btn.textContent = ex;
-    btn.addEventListener('click', () => { void submit(ex); });
+    btn.addEventListener('click', () => { void submit(ex + '\r'); });
     examples.appendChild(btn);
   }
   for (const ex of NODE_EXAMPLES) {
@@ -288,7 +283,7 @@ export const startPage = async (): Promise<void> => {
     // whichever mode is active. If the user hasn't run `node` first, these
     // will be interpreted as shell commands and mostly fail; that's fine
     // and the label above the section explains the ordering.
-    btn.addEventListener('click', () => { void submit(ex); });
+    btn.addEventListener('click', () => { void submit(ex + '\r'); });
     nodeExamples.appendChild(btn);
   }
   // Crypto examples run inside the Node REPL (same as NODE_EXAMPLES).
@@ -300,19 +295,13 @@ export const startPage = async (): Promise<void> => {
     // in title (hover tooltip) and click handler.
     btn.textContent = ex.length > 72 ? ex.slice(0, 69) + '...' : ex;
     btn.title = ex;
-    btn.addEventListener('click', () => { void submit(ex); });
+    btn.addEventListener('click', () => { void submit(ex + '\r'); });
     cryptoExamples.appendChild(btn);
-  }
-  for (const ex of SQLITE_EXAMPLES) {
-    const btn = document.createElement('button');
-    btn.textContent = ex;
-    btn.addEventListener('click', () => { void submit(ex); });
-    sqliteExamples.appendChild(btn);
   }
   for (const ex of PYTHON_EXAMPLES) {
     const btn = document.createElement('button');
     btn.textContent = ex;
-    btn.addEventListener('click', () => { void submit(ex); });
+    btn.addEventListener('click', () => { void submit(ex + '\r'); });
     pythonExamples.appendChild(btn);
   }
 };

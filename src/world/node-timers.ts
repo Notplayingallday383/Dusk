@@ -4,10 +4,10 @@
 type STFn = (handler: Function, timeout?: number, ...args: unknown[]) => unknown;
 type CTFn = (id: unknown) => void;
 
-const _setTimeout: STFn = ((globalThis as { setTimeout?: STFn }).setTimeout ?? ((fn: Function) => { fn(); return 0; })) as STFn;
-const _setInterval: STFn = ((globalThis as { setInterval?: STFn }).setInterval ?? (() => 0)) as STFn;
-const _clearTimeout: CTFn = ((globalThis as { clearTimeout?: CTFn }).clearTimeout ?? (() => undefined)) as CTFn;
-const _clearInterval: CTFn = ((globalThis as { clearInterval?: CTFn }).clearInterval ?? (() => undefined)) as CTFn;
+const _setTimeout: STFn = (handler, timeout, ...args) => (globalThis as { setTimeout: STFn }).setTimeout(handler, timeout, ...args);
+const _setInterval: STFn = (handler, timeout, ...args) => (globalThis as { setInterval: STFn }).setInterval(handler, timeout, ...args);
+const _clearTimeout: CTFn = (id) => (globalThis as { clearTimeout: CTFn }).clearTimeout(id);
+const _clearInterval: CTFn = (id) => (globalThis as { clearInterval: CTFn }).clearInterval(id);
 
 export { _setTimeout as setTimeout, _setInterval as setInterval, _clearTimeout as clearTimeout, _clearInterval as clearInterval };
 

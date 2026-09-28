@@ -24,3 +24,15 @@ test('node:events EventEmitter on/emit/once/off/removeAllListeners', async () =>
   expect(s).toContain('afterOff=5');
   expect(s).toContain('z=0');
 }, 60_000);
+
+test('events CommonJS default export constructs EventEmitter subclasses', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((text) => out.push(text), { fs: 'memory' });
+
+  try {
+    await repl.feed("const EventEmitter = require('events'); class Server extends EventEmitter { constructor() { super(); this._state = 0; } } const server = new Server(); server.on('ready', () => {}); process.stdout.write(String(server.listenerCount('ready')));");
+    expect(out.join('')).toContain('1');
+  } finally {
+    await repl.engine.terminate();
+  }
+}, 60_000);

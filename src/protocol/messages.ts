@@ -2,14 +2,22 @@ export interface BufferInit {
   lengthBuffer: SharedArrayBuffer;
   valueBuffer: SharedArrayBuffer;
   js: string;
+  esbuildBrowserUrl?: string;
+  esbuildWasmUrl?: string;
+  rollupBrowserWasmBytes?: ArrayBuffer;
 }
 
-export interface WaitMessage { type: 'wait'; }
-export interface EvalMessage { type: 'eval'; js: string; }
-export interface DoneMessage { type: 'done'; ret?: unknown; }
-export interface ReadyMessage { type: 'ready'; }
+export interface SyncRpcMessage { syncRpcSeq?: number; }
 
-export interface FuncMessage {
+export interface WaitMessage extends SyncRpcMessage { type: 'wait'; canRun?: boolean; }
+export interface DoneMessage extends SyncRpcMessage { type: 'done'; ret?: unknown; primary?: boolean; }
+export interface ExitMessage extends SyncRpcMessage { type: 'exit'; exitCode?: number; }
+export interface EvalMessage { type: 'eval'; js: string; primary: boolean; }
+export interface SyncRpcConsumedMessage { type: 'sync-rpc-consumed'; syncRpcSeq: number; }
+export interface ReadyMessage extends SyncRpcMessage { type: 'ready'; }
+
+export interface FuncMessage extends SyncRpcMessage {
+  type?: never;
   f: string;
   [key: string]: unknown;
 }
@@ -17,12 +25,12 @@ export interface FuncMessage {
 export type WorldToHost =
   | WaitMessage
   | DoneMessage
+  | ExitMessage
+  | SyncRpcConsumedMessage
   | ReadyMessage
   | FuncMessage;
 
-export type HostToWorld =
-  | EvalMessage
-  | { value?: unknown; ptr?: number };
+export type HostToWorld = EvalMessage | { value?: unknown; ptr?: number };
 
 // Per-IPC-message ceiling. Sized to fit typical fs.readFile and command
 // responses while keeping RAM cost reasonable (this SAB is allocated once

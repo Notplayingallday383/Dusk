@@ -31,6 +31,31 @@ test('bootRepl REPL can spawn /bin/echo directly via require(child_process)', as
   expect(text).toContain('hi');
 }, 60_000);
 
+test('bootRepl REPL completes nested guest spawnSync before SIGCHLD dispatch', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  repl.processManager.registerBinary('/bin/nested-spawn-sync', `
+    const cp = require('node:child_process');
+    const result = cp.spawnSync('/bin/sh', ['-c', 'echo nested-guest']);
+    process.stdout.write('inner=' + result.status + ':' + new TextDecoder().decode(result.stdout));
+    process.exit(result.status);
+  `);
+
+  await repl.feed(`
+    const cp = require('node:child_process');
+    let releaseSigchld;
+    const sigchld = new Promise((resolve) => { releaseSigchld = resolve; });
+    process.on('SIGCHLD', () => releaseSigchld());
+    const result = cp.spawnSync('/bin/nested-spawn-sync', []);
+    await sigchld;
+    process.stdout.write('outer=' + result.status + ':' + new TextDecoder().decode(result.stdout));
+  `);
+  await repl.engine.terminate();
+
+  const text = out.join('');
+  expect(text).toContain('outer=0:inner=0:nested-guest');
+}, 15_000);
+
 test('bootRepl ProcessManager has /bin/sh and builtin binaries registered', async () => {
   const out: string[] = [];
   const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });

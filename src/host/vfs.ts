@@ -8,11 +8,28 @@ export interface VFS {
   mkdir(path: string, opts?: { recursive?: boolean }): void;
   rm(path: string): void;
   exists(path: string): boolean;
-  stat(path: string): { isFile: boolean; isDirectory: boolean };
+  stat(path: string): VFSStat;
   rename(from: string, to: string): void;
   symlink(target: string, path: string): void;
   readlink(path: string): string;
-  lstat(path: string): { isFile: boolean; isDirectory: boolean; isSymlink: boolean };
+  lstat(path: string): VFSStat & { isSymlink: boolean };
+}
+
+export interface VFSStat {
+  isFile: boolean;
+  isDirectory: boolean;
+  size: number;
+  mtimeMs: number;
+  atimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+}
+
+interface Metadata {
+  mtimeMs: number;
+  atimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
 }
 
 const norm = (p: string): string => {
@@ -67,6 +84,28 @@ export const createVFS = (): VFS => {
   const files = new Map<string, Uint8Array>();
   const dirs = new Set<string>(['/']);
   const symlinks = new Map<string, string>();  // path → target
+  const metadata = new Map<string, Metadata>();
+  let lastTimestamp = 0;
+  const timestamp = (): number => {
+    lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+    return lastTimestamp;
+  };
+  const createMetadata = (): Metadata => {
+    const now = timestamp();
+    return { mtimeMs: now, atimeMs: now, ctimeMs: now, birthtimeMs: now };
+  };
+  metadata.set('/', createMetadata());
+  const fileStat = (path: string): VFSStat => {
+    const node = metadata.get(path);
+    const bytes = files.get(path);
+    if (!node || !bytes) throw new Error('ENOENT: no such file ' + path);
+    return { isFile: true, isDirectory: false, size: bytes.length, ...node };
+  };
+  const directoryStat = (path: string): VFSStat => {
+    const node = metadata.get(path);
+    if (!node) throw new Error('ENOENT: no such directory ' + path);
+    return { isFile: false, isDirectory: true, size: 0, ...node };
+  };
 
   const ensureDir = (d: string): void => {
     if (d === '/' || dirs.has(d)) return;
@@ -93,6 +132,11 @@ export const createVFS = (): VFS => {
       const n = norm(path);
       ensureDir(dirname(n));
       files.set(n, encodeUtf8(data));
+      const now = timestamp();
+      const existing = metadata.get(n);
+      metadata.set(n, existing
+        ? { ...existing, mtimeMs: now, ctimeMs: now }
+        : { mtimeMs: now, atimeMs: now, ctimeMs: now, birthtimeMs: now });
     },
     readFileBytes(path) {
       const resolved = resolveSymlinks(path);
@@ -105,6 +149,11 @@ export const createVFS = (): VFS => {
       const n = norm(path);
       ensureDir(dirname(n));
       files.set(n, data.slice());
+      const now = timestamp();
+      const existing = metadata.get(n);
+      metadata.set(n, existing
+        ? { ...existing, mtimeMs: now, ctimeMs: now }
+        : { mtimeMs: now, atimeMs: now, ctimeMs: now, birthtimeMs: now });
     },
     fileSize(path) {
       const resolved = resolveSymlinks(path);
@@ -126,18 +175,27 @@ export const createVFS = (): VFS => {
       if (opts?.recursive) {
         const segs = n.split('/').filter(Boolean);
         let cur = '';
-        for (const s of segs) { cur += '/' + s; dirs.add(cur); }
+        for (const s of segs) {
+          cur += '/' + s;
+          if (!dirs.has(cur)) {
+            dirs.add(cur);
+            metadata.set(cur, createMetadata());
+          }
+        }
       } else {
         ensureDir(dirname(n));
         dirs.add(n);
+        if (!metadata.has(n)) metadata.set(n, createMetadata());
       }
     },
     rm(path) {
       const n = norm(path);
       files.delete(n);
       dirs.delete(n);
+      metadata.delete(n);
       for (const f of [...files.keys()]) if (f.startsWith(n + '/')) files.delete(f);
       for (const d of [...dirs]) if (d.startsWith(n + '/')) dirs.delete(d);
+      for (const path of [...metadata.keys()]) if (path === n || path.startsWith(n + '/')) metadata.delete(path);
     },
     exists(path) {
       const n = norm(path);
@@ -145,20 +203,43 @@ export const createVFS = (): VFS => {
     },
     stat(path) {
       const n = norm(path);
-      if (files.has(n)) return { isFile: true, isDirectory: false };
-      if (dirs.has(n)) return { isFile: false, isDirectory: true };
+      if (files.has(n)) return fileStat(n);
+      if (dirs.has(n)) return directoryStat(n);
       throw new Error('ENOENT: ' + n);
     },
     rename(from, to) {
       const nf = norm(from), nt = norm(to);
       const f = files.get(nf);
-      if (f === undefined) throw new Error('ENOENT: ' + nf);
-      files.delete(nf);
-      files.set(nt, f);
+      if (f !== undefined) {
+        ensureDir(dirname(nt));
+        files.delete(nf);
+        files.set(nt, f);
+        const node = metadata.get(nf);
+        metadata.delete(nf);
+        if (node) metadata.set(nt, node);
+        return;
+      }
+      if (!dirs.has(nf)) throw new Error('ENOENT: ' + nf);
+      if (nt === nf || nt.startsWith(nf + '/')) throw new Error('EINVAL: ' + nt);
+      ensureDir(dirname(nt));
+      const movedFiles = [...files.entries()].filter(([path]) => path.startsWith(nf + '/'));
+      const movedDirs = [...dirs].filter((path) => path === nf || path.startsWith(nf + '/'));
+      const movedLinks = [...symlinks.entries()].filter(([path]) => path === nf || path.startsWith(nf + '/'));
+      const movedMetadata = [...metadata.entries()].filter(([path]) => path === nf || path.startsWith(nf + '/'));
+      for (const [path] of movedFiles) files.delete(path);
+      for (const path of movedDirs) dirs.delete(path);
+      for (const [path] of movedLinks) symlinks.delete(path);
+      for (const [path] of movedMetadata) metadata.delete(path);
+      const movedPath = (path: string): string => nt + path.slice(nf.length);
+      for (const [path, bytes] of movedFiles) files.set(movedPath(path), bytes);
+      for (const path of movedDirs) dirs.add(movedPath(path));
+      for (const [path, target] of movedLinks) symlinks.set(movedPath(path), target);
+      for (const [path, node] of movedMetadata) metadata.set(movedPath(path), node);
     },
     symlink(target, path) {
       const n = norm(path);
       symlinks.set(n, target);
+      if (!metadata.has(n)) metadata.set(n, createMetadata());
     },
     readlink(path) {
       const n = norm(path);
@@ -168,9 +249,13 @@ export const createVFS = (): VFS => {
     },
     lstat(path) {
       const n = norm(path);
-      if (symlinks.has(n)) return { isFile: false, isDirectory: false, isSymlink: true };
-      if (files.has(n)) return { isFile: true, isDirectory: false, isSymlink: false };
-      if (dirs.has(n)) return { isFile: false, isDirectory: true, isSymlink: false };
+      if (symlinks.has(n)) {
+        const node = metadata.get(n);
+        if (!node) throw new Error('ENOENT: ' + n);
+        return { isFile: false, isDirectory: false, isSymlink: true, size: 0, ...node };
+      }
+      if (files.has(n)) return { ...fileStat(n), isSymlink: false };
+      if (dirs.has(n)) return { ...directoryStat(n), isSymlink: false };
       throw new Error('ENOENT: ' + n);
     },
   };

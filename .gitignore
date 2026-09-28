@@ -1,9 +1,13 @@
 .debug/
+.wasm-bindgen/
 node_modules/
 dist/
 .VSCodeCounter/
 .vitest-attachments/
 package-lock.json
 test/__screenshots__/
-vendor/
+/vendor/
 lib/
+docs/
+graphify-out/
+*.tgz

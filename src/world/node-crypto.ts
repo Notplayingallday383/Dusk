@@ -49,13 +49,38 @@ const bytesToBuffer = (bytes: Uint8Array): Uint8Array => {
 
 // ---- random ----
 
-const getRandomValues = (buf: Uint8Array): Uint8Array => {
+type IntegerTypedArray =
+  | Int8Array
+  | Uint8Array
+  | Uint8ClampedArray
+  | Int16Array
+  | Uint16Array
+  | Int32Array
+  | Uint32Array;
+
+const isIntegerTypedArray = (value: unknown): value is IntegerTypedArray =>
+  value instanceof Int8Array ||
+  value instanceof Uint8Array ||
+  value instanceof Uint8ClampedArray ||
+  value instanceof Int16Array ||
+  value instanceof Uint16Array ||
+  value instanceof Int32Array ||
+  value instanceof Uint32Array;
+
+export const getRandomValues = <T extends IntegerTypedArray>(buf: T): T => {
+  if (!isIntegerTypedArray(buf)) throw new TypeError('crypto.getRandomValues expects an integer typed array');
+  if (buf.byteLength > 65_536) {
+    const error = new Error('The requested length exceeds 65,536 bytes');
+    error.name = 'QuotaExceededError';
+    throw error;
+  }
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
     crypto.getRandomValues(buf);
     return buf;
   }
   const arr = __call('crypto.random', { size: buf.length }) as number[];
-  for (let i = 0; i < arr.length; i++) buf[i] = arr[i] ?? 0;
+  const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (let i = 0; i < arr.length; i++) bytes[i] = arr[i] ?? 0;
   return buf;
 };
 
@@ -849,6 +874,7 @@ export const nodeCrypto = {
   randomFillSync,
   randomInt,
   randomUUID,
+  getRandomValues,
   timingSafeEqual,
   Hash,
   Hmac,

@@ -110,6 +110,34 @@ test('/bin/sh with PTY: typed characters are echoed via master.onMasterData (coo
   repl.engine.terminate();
 }, 30_000);
 
+test('dsh resolves node script paths relative to its cwd', async () => {
+  const repl = await bootRepl(() => {}, {
+    fs: 'memory',
+    seed: { '/tmp/e.js': 'console.log("relative-script");' },
+  });
+  const sh = await repl.processManager.spawn('/bin/dsh', [], {
+    cwd: '/tmp',
+    env: { HOME: '/tmp', PATH: '/usr/local/bin:/usr/bin:/bin', TERM: 'xterm-256color', USER: 'dusk' },
+    pty: { cols: 80, rows: 24 },
+  });
+
+  let terminal = '';
+  sh.master!.onMasterData((bytes) => { terminal += decode(bytes); });
+  void pump(sh.stdout, () => {});
+  void pump(sh.stderr, () => {});
+
+  await sh.stdin.write(new TextEncoder().encode('node e.js\n'));
+  const deadline = Date.now() + 5_000;
+  while (!terminal.includes('relative-script') && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  expect(terminal).toContain('relative-script');
+
+  await sh.stdin.close();
+  await sh.exit;
+  repl.engine.terminate();
+}, 30_000);
+
 // New builtin binaries added for the demo: ls, mkdir, rm, touch, whoami, hostname, clear.
 test('/bin/ls lists directory entries; mkdir/touch/rm round-trip works', async () => {
   const out: string[] = [];

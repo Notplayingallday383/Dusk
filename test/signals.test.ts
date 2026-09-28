@@ -52,6 +52,36 @@ test('SIGCHLD is delivered to parent when child exits', async () => {
   expect(code).toBe(0);
 }, 60_000);
 
+test('nested guest spawnSync receives its shell result before SIGCHLD dispatch', async () => {
+  const pm = new ProcessManager(createMemoryBackend());
+  pm.registerBinary(
+    '/bin/parent-sync',
+    `const order = [];
+     let releaseChildExit;
+     const childExited = new Promise((resolve) => { releaseChildExit = resolve; });
+     process.on('SIGCHLD', () => { order.push('sigchld'); releaseChildExit(); });
+     const cp = require('node:child_process');
+     const result = cp.spawnSync('/bin/sh', ['-c', 'echo nested-shell']);
+     order.push('reply:' + result.status);
+     await childExited;
+     process.stdout.write(order.join(','));
+     process.exit(result.status);`,
+  );
+
+  const proc = await pm.spawn('/bin/parent-sync', [], { cwd: '/' });
+  const code = await proc.exit;
+  const reader = proc.stdout.getReader();
+  let output = '';
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    output += new TextDecoder().decode(chunk.value);
+  }
+
+  expect(code).toBe(0);
+  expect(output).toBe('reply:0,sigchld');
+}, 60_000);
+
 test('kill(-pgid) broadcasts to every process in the group', async () => {
   const pm = new ProcessManager(createMemoryBackend());
   // Engine has no real setTimeout (fake fires immediately). Use a Promise gate

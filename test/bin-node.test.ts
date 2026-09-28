@@ -21,6 +21,7 @@ class NodeServerRelaySocket implements RelaySocket {
 }
 
 class NodeServerRelay implements RelayListener {
+  authorizeListen = (): boolean => true;
   handler: ((socket: RelaySocket) => void) | undefined;
 
   registerListener(_host: string, _port: number, handler: (socket: RelaySocket) => void): () => void {
@@ -42,6 +43,28 @@ test('/bin/node -e prints expression', async () => {
   await new Promise((r) => setTimeout(r, 700));
   const text = out.join('');
   expect(text).toContain('OUT=hello-from-node');
+  expect(text).toContain('STATUS=0');
+  repl.engine.terminate();
+}, 60_000);
+
+test('/bin/node exposes global as the guest globalThis', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed("const cp = require('node:child_process'); const r = cp.spawnSync('/bin/node', ['-e', 'process.stdout.write(String(global === globalThis))']); process.stdout.write('OUT=' + Buffer.from(r.stdout).toString() + '|STATUS=' + r.status + '\\n')\n");
+  await new Promise((r) => setTimeout(r, 700));
+  const text = out.join('');
+  expect(text).toContain('OUT=true');
+  expect(text).toContain('STATUS=0');
+  repl.engine.terminate();
+}, 60_000);
+
+test('/bin/node launcher exposes main completion through __mainPromise', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed("const cp = require('node:child_process'); const r = cp.spawnSync('/bin/node', ['-e', 'queueMicrotask(() => process.stdout.write(String(!!globalThis.__process.__mainPromise)))']); process.stdout.write('OUT=' + Buffer.from(r.stdout).toString() + '|STATUS=' + r.status + '\\n')\n");
+  await new Promise((r) => setTimeout(r, 700));
+  const text = out.join('');
+  expect(text).toContain('OUT=true');
   expect(text).toContain('STATUS=0');
   repl.engine.terminate();
 }, 60_000);

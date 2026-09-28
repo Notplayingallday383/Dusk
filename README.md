@@ -1,23 +1,23 @@
 # @nightnetwork/dusk — DuskJS
 
-**Node.js in a browser tab.** A complete JavaScript runtime powered by SpiderMonkey WASI.
+**Node.js in a browser tab.** A browser-hosted JavaScript runtime with Node.js-compatible APIs.
 
-DuskJS runs a full Node.js-compatible environment inside WebAssembly, in any modern browser. It boots a SpiderMonkey engine per process, provides familiar `node:*` modules, a POSIX shell, SQLite, Python, persistent storage, and real networking — all without a server.
+DuskJS runs native JavaScript inside Web Workers by default, with SpiderMonkey WASI available only through `runtime: 'spidermonkey-legacy'`. It provides familiar `node:*` modules, a POSIX shell, Python via Pyodide, persistent storage, and networking through browser-supported transports and optional relays.
 
 ## Features
 
-- **SpiderMonkey WASI engine** — each process is an isolated SpiderMonkey instance running in a Web Worker
+- **Native worker engine** — JavaScript processes run in isolated Web Workers by default; SpiderMonkey WASI is opt-in with `runtime: 'spidermonkey-legacy'`
 - **Node.js core modules** — `node:http`, `node:net`, `node:fs`, `node:crypto`, `node:path`, `node:os`, `node:child_process`, `node:stream`, `node:events`, `node:buffer`, `node:url`, `node:querystring`, `node:zlib`, and more
 - **POSIX shell (dsh)** — built-in shell with `grep`, `sed`, `awk`, `jq`, `sort`, `uniq`, `find`, `head`, `tail`, `wc`, `cat`, `ls`, `mkdir`, `rm`, `cp`, `mv`, `chmod`, `env`, `echo`, `printf`, `test`, `xargs`, `tee`, `tr`, `cut`, `basename`, `dirname`, `date`, `sleep`, `true`, `false`, `yes`, pipes, redirects, variables, and control flow
 - **Interactive Node REPL** — `/bin/node` with persistent context across evaluations
-- **SQLite** — via sql.js, accessible from the shell (`sqlite3`) and programmatically
+- **SQLite extension** — install `@nightnetwork/dusk-sqlite`, then restart with its explicitly imported host extension
 - **Python** — via Pyodide, accessible from the shell (`python3`) with full stdlib
 - **Persistent filesystem (TFS/OPFS)** — files survive page reloads using Origin Private File System
 - **PTY support** — full pseudo-terminal with line discipline, echo, `^C`/`^D` handling, and `SIGWINCH` resize
-- **DPM package manager** — `dpm`, `dpx`, `npm`, `npx`, `pnpm` shims for installing packages from the registry
+- **DPM package manager** — Rust browser package manager behind `dpm`, `dpx`, `npm`, `npx`, and `pnpm`; it installs verified registry, HTTPS tarball, local tarball, and workspace packages
 - **MoonBeam relay networking** — connect processes to external servers via WebSocket relay
-- **Nova HTTP client** — Rust-based `libcurl` replacement (nova-wasm) for outbound HTTP/HTTPS
-- **Engine pool** — pre-warmed SpiderMonkey instances for fast process spawning
+- **Nova HTTP client** — `@nightnetwork/nova`, the Rust/WASM `libcurl` replacement for outbound HTTP/HTTPS
+- **Engine pool** — pre-compiles SpiderMonkey WASI for `spidermonkey-legacy` only; native workers spawn on demand
 - **Signal delivery** — SIGINT, SIGTERM, SIGKILL, SIGCHLD, SIGWINCH, and more
 
 ## Installation
@@ -26,12 +26,21 @@ DuskJS runs a full Node.js-compatible environment inside WebAssembly, in any mod
 npm install @nightnetwork/dusk
 ```
 
+The published package is tested as a Vite browser consumer. Serve the app in a cross-origin-isolated context (COOP/COEP) so Dusk can use `SharedArrayBuffer` for worker IPC:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+The library build is not bundler-agnostic: bare esbuild requires a custom worker/asset pipeline to emit and serve Dusk's worker scripts and WASM assets, plus handling for Pyodide's `node:*` imports. Bare esbuild is not supported out of the box.
+
 ## Quick Start
 
 ```ts
 import { bootRepl } from '@nightnetwork/dusk';
 
-const repl = await bootRepl((text) => process.stdout.write(text));
+const repl = await bootRepl((text) => console.log(text));
 
 // Evaluate JavaScript
 await repl.feed('console.log("Hello from DuskJS!")');
@@ -65,6 +74,22 @@ sh.master.onMasterData((bytes) => terminal.write(bytes));
 await sh.stdin.write(new TextEncoder().encode('ls /bin\n'));
 ```
 
+### SQLite extension
+
+SQLite is intentionally not part of the base Dusk bundle. In the Dusk project, install it with `dpm install @nightnetwork/dusk-sqlite`; after the install completes, restart Dusk and activate the host package explicitly:
+
+```ts
+import { bootRepl } from '@nightnetwork/dusk';
+import { createSqliteExtension } from '@nightnetwork/dusk-sqlite';
+
+await bootRepl(write, {
+  extensionCwd: '/project',
+  extensions: [createSqliteExtension()],
+});
+```
+
+The activation checks the installed package's versioned `dusk.extension` capability manifest and its DPM lockfile integrity before registering `/bin/sqlite3` and `sqlite.*` IPC functions. Restarting is required; installed package files are never executed by Dusk directly.
+
 ## API Reference
 
 ### `bootRepl(write, options?): Promise<BootReplResult>`
@@ -83,6 +108,7 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `net` | `BootReplNetOptions` | `undefined` | Networking configuration (libcurl or relay) |
+| `runtime` | `'native' \| 'spidermonkey-legacy'` | `'native'` | Select the native worker engine or opt into SpiderMonkey WASI |
 | `seed` | `Record<string, string>` | `{}` | Pre-populate files in the virtual filesystem |
 | `fs` | `'tfs' \| 'memory'` | `'tfs'` | Filesystem backend — `tfs` persists via OPFS, `memory` is ephemeral |
 | `user` | `string` | `'user'` | Username for the environment |
@@ -90,6 +116,30 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 | `layout` | `boolean` | `true` | Use the layered filesystem layout (ephemeral + persistent) |
 | `via` | `'startRepl' \| 'node'` | `'startRepl'` | How `feed()` routes input — via the pid-0 engine or a spawned `/bin/node` |
 | `skipPidZero` | `boolean` | `false` | Skip creating the pid-0 engine to save ~100MB RAM |
+| `ssh` | `SshOptions` | `undefined` | Host-supplied SSH adapter, explicit host-key policy, and explicit LunaSSH WASM URLs |
+
+### SSH Adapter
+
+Dusk does not bundle LunaSSH or its WASM assets. The host supplies an adapter and both asset URLs explicitly:
+
+```ts
+import { bootRepl } from '@nightnetwork/dusk';
+import { createDuskSshAdapter } from '@nightnetwork/lunassh/dusk';
+
+await bootRepl(write, {
+  net: { relay },
+  ssh: {
+    adapter: createDuskSshAdapter(),
+    hostKeyVerification: { knownHosts: ['host ssh-ed25519 AAAA...'] },
+    wasm: {
+      wasmPath: '/assets/lunassh.wasm',
+      wasmExecPath: '/assets/wasm_exec.js',
+    },
+  },
+});
+```
+
+Use `{ insecureSkipHostKeyVerification: true }` only when an explicit insecure opt-out is intended.
 
 **`BootReplResult`:**
 
@@ -97,7 +147,7 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 |----------|------|-------------|
 | `feed` | `(line: string) => Promise<void>` | Send a line of input to the REPL |
 | `processManager` | `ProcessManager` | Spawn and manage child processes |
-| `engine` | `EngineInstance` | The pid-0 SpiderMonkey engine (stub if `skipPidZero`) |
+| `engine` | `EngineInstance` | The pid-0 worker engine (stub if `skipPidZero`) |
 | `node` | `DuskProcessHandle?` | Present when `via: 'node'` |
 
 ### `ProcessManager`
@@ -141,14 +191,14 @@ Manages the process tree, binary registry, and inter-process communication.
 
 | Export | Description |
 |--------|-------------|
-| `createEngine` | Create a standalone SpiderMonkey engine instance |
+| `createEngine` | Create a standalone native worker engine instance |
 | `createRunner` | Low-level engine runner |
 | `startRepl` | Create a REPL interface on an existing engine |
 | `createMemoryBackend` | Ephemeral in-memory filesystem backend |
 | `createTfsBackend` | Persistent TFS/OPFS filesystem backend |
 | `createLayoutBackend` | Layered filesystem (ephemeral over persistent) |
-| `initEnginePool` / `isPoolWarm` | Pre-warm engine instances for faster spawns |
-| `prewarmEngine` | Pre-warm the SpiderMonkey WASM binary |
+| `initEnginePool` / `isPoolWarm` | Pre-compile SpiderMonkey WASI for the legacy runtime only |
+| `prewarmEngine` | Pre-compile the legacy SpiderMonkey WASM binary |
 
 ## Shell Commands (dsh)
 
@@ -162,7 +212,6 @@ Manages the process tree, binary registry, and inter-process communication.
 | **JSON** | `jq` |
 | **Misc** | `date`, `sleep`, `whoami`, `hostname`, `uname`, `which`, `type` |
 | **Node** | `node`, `js-exec` (inline JS evaluation) |
-| **Data** | `sqlite3` (via sql.js host IPC) |
 | **Python** | `python3`, `python` (via Pyodide host IPC) |
 | **Packages** | `dpm`, `dpx`, `npm`, `npx`, `pnpm` |
 
@@ -199,7 +248,7 @@ DuskJS supports outbound HTTP/HTTPS and TCP via two mechanisms:
 Nova is a Rust-based WASM module that provides `fetch`-style HTTP via a Wisp WebSocket proxy:
 
 ```ts
-import nova from 'nova-wasm';
+import * as nova from '@nightnetwork/nova';
 
 const repl = await bootRepl(write, {
   net: {
@@ -284,7 +333,7 @@ const repl = await bootRepl(write, {
 │  │       │           │           │           │   │
 │  │       ▼           ▼           ▼           │   │
 │  │  ┌─────────────────────────────────────┐  │   │
-│  │  │     SpiderMonkey WASI Workers       │  │   │
+│  │  │     Native JavaScript Workers       │  │   │
 │  │  │  (one Web Worker per engine)        │  │   │
 │  │  └─────────────────────────────────────┘  │   │
 │  └───────────────────────────────────────────┘   │
@@ -295,20 +344,20 @@ const repl = await bootRepl(write, {
 └─────────────────────────────────────────────────┘
 ```
 
-- Each process runs in its own SpiderMonkey WASI Web Worker
+- JavaScript engines run in native Web Workers by default; `spidermonkey-legacy` selects SpiderMonkey WASI workers instead
 - The `ProcessManager` on the main thread orchestrates IPC, I/O routing, signal delivery, and lifecycle
 - World-side shims (`node-fs.ts`, `node-net.ts`, `node-http.ts`, etc.) run inside each engine and communicate with the host via synchronous IPC (`ipc.send`)
-- The engine pool pre-warms SpiderMonkey instances to reduce spawn latency
+- The engine pool pre-compiles SpiderMonkey WASI only for the legacy runtime; native workers start on demand
 
 ## Browser Requirements
 
-- **`CrossOriginIsolated` context** — required for `SharedArrayBuffer`, which SpiderMonkey WASI uses for synchronous IPC between the worker and main thread
+- **Cross-origin-isolated context** — required for `SharedArrayBuffer` and synchronous IPC between workers and the main thread (both runtimes)
 - Set these response headers on your server:
   ```
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   ```
-- Modern browser with Web Workers, OPFS (for persistent FS), and `CompressionStream`/`DecompressionStream` (for zlib)
+- Modern browser with Web Workers, OPFS and the Web Locks API (both required for the persistent TFS backend), and `CompressionStream`/`DecompressionStream` (for zlib). Use `{ fs: 'memory' }` when origin-wide persistent locking is unavailable.
 
 ## Building from Source
 

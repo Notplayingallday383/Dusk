@@ -311,7 +311,6 @@ def('ERR_INVALID_OPT_VALUE_ENCODING', (encoding: unknown) => makeError(TypeError
 def('ERR_INVALID_PERFORMANCE_MARK', (name: unknown) => makeError(Error, 'ERR_INVALID_PERFORMANCE_MARK', `The "${String(name)}" performance mark has not been set`));
 def('ERR_INVALID_TUPLE', (name: unknown, reason: unknown) => makeError(TypeError, 'ERR_INVALID_TUPLE', `${String(name)} must be ${String(reason)}`));
 def('ERR_INVALID_URI', () => makeError(URIError, 'ERR_INVALID_URI', 'URI malformed'));
-def('ERR_LOAD_SQLITE_EXTENSION', () => makeError(Error, 'ERR_LOAD_SQLITE_EXTENSION', 'Failed to load SQLite extension'));
 def('ERR_MEMORY_ALLOCATION_FAILED', () => makeError(Error, 'ERR_MEMORY_ALLOCATION_FAILED', 'Failed to allocate memory'));
 def('ERR_METHOD_NOT_IMPLEMENTED', (method: unknown) => makeError(Error, 'ERR_METHOD_NOT_IMPLEMENTED', `${String(method)} is not implemented`));
 def('ERR_MISSING_OPTION', (name: unknown) => makeError(TypeError, 'ERR_MISSING_OPTION', `${String(name)} is required`));

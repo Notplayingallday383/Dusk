@@ -6,10 +6,11 @@ import pkg from './package.json';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Library build: bundles src/index.ts into a single ES module consumers can
-// import from any bundler (Vite, Webpack, Rollup, esbuild, Next, ...). The
-// worldSource plugin resolves `?worldsrc` imports at build time so the
-// output is plain JS with no Vite-specific loaders required downstream.
+// Library build: bundles src/index.ts for Vite browser consumers. The
+// worldSource plugin resolves `?worldsrc` imports at build time, but Vite
+// still needs to relocate emitted worker and WASM assets for the browser.
+// Bare esbuild browser bundling requires a custom worker/asset pipeline
+// and handling for Pyodide's node:* imports; it is not supported out of the box.
 //
 // Output goes to `lib/` (not `dist/`) so it doesn't collide with the
 // app-mode build (`npm run build`) which serves the src/demo/ REPL page
@@ -34,6 +35,8 @@ export default defineConfig({
     // else (including ?worldsrc bundles and worker sources) gets baked in.
     rollupOptions: {
       external: [
+        '@nightnetwork/dpm',
+        '@nightnetwork/nova',
         '@terbiumos/tfs',
         '@wasmer/wasi',
         '@wasmer/wasmfs',

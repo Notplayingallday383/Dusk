@@ -55,6 +55,8 @@ export class HttpParser {
   private chunked = false;
   private upgrade = false;
   private shouldKeepAlive = true;
+  private connectionClose = false;
+  private connectionKeepAlive = false;
   private currentHeaders: HttpHeadersInfo = {
     versionMajor: 1, versionMinor: 1, headers: [],
     upgrade: false, shouldKeepAlive: true,
@@ -91,13 +93,19 @@ export class HttpParser {
         }
         if (this.chunked) this.state = S.BODY_CHUNKED_SIZE;
         else if (this.contentLength === 0) {
-          this.state = S.DONE;
+          this.state = this.type === 'REQUEST' ? S.START : S.DONE;
           if (this.onMessageComplete) this.onMessageComplete();
+          if (this.type === 'REQUEST') continue;
           break;
         }
         else if (this.contentLength > 0) this.state = S.BODY_LENGTH;
         else if (this.type === 'RESPONSE') this.state = S.BODY_UNTIL_EOF;
-        else { this.state = S.DONE; if (this.onMessageComplete) this.onMessageComplete(); break; }
+        else {
+          this.state = this.type === 'REQUEST' ? S.START : S.DONE;
+          if (this.onMessageComplete) this.onMessageComplete();
+          if (this.type === 'REQUEST') continue;
+          break;
+        }
       } else if (this.state === S.BODY_LENGTH) {
         const avail = this.buf.length - cursor;
         const want = Math.min(avail, this.contentLength);
@@ -105,8 +113,9 @@ export class HttpParser {
         cursor += want;
         this.contentLength -= want;
         if (this.contentLength <= 0) {
-          this.state = S.DONE;
+          this.state = this.type === 'REQUEST' ? S.START : S.DONE;
           if (this.onMessageComplete) this.onMessageComplete();
+          if (this.type === 'REQUEST') continue;
           break;
         }
         break;
@@ -140,11 +149,15 @@ export class HttpParser {
           this.state = S.BODY_CHUNKED_SIZE;
         } else break;
       } else if (this.state === S.BODY_CHUNKED_END) {
-        const eol = findCRLF(this.buf, cursor);
-        if (eol < 0) break;
-        cursor = eol + 2;
-        this.state = S.DONE;
+        if (this.buf[cursor] === CR && this.buf[cursor + 1] === LF) cursor += 2;
+        else {
+          const trailerEnd = findHeaderEnd(this.buf, cursor);
+          if (trailerEnd < 0) break;
+          cursor = trailerEnd + 4;
+        }
+        this.state = this.type === 'REQUEST' ? S.START : S.DONE;
         if (this.onMessageComplete) this.onMessageComplete();
+        if (this.type === 'REQUEST') continue;
         break;
       } else if (this.state === S.BODY_UNTIL_EOF) {
         const avail = this.buf.length - cursor;
@@ -167,6 +180,12 @@ export class HttpParser {
     }
   }
 
+  takeRemaining(): Uint8Array {
+    const remaining = this.buf;
+    this.buf = new Uint8Array(0);
+    return remaining;
+  }
+
   private _parseHead(bytes: Uint8Array): boolean {
     const text = decodeAscii(bytes, 0, bytes.length);
     const lines = text.split('\r\n');
@@ -181,6 +200,8 @@ export class HttpParser {
     this.chunked = false;
     this.upgrade = false;
     this.shouldKeepAlive = true;
+    this.connectionClose = false;
+    this.connectionKeepAlive = false;
 
     if (this.type === 'REQUEST') {
       const parts = firstLine.split(' ');
@@ -215,13 +236,16 @@ export class HttpParser {
       } else if (lname === 'transfer-encoding' && /chunked/i.test(value)) {
         this.chunked = true;
       } else if (lname === 'connection') {
-        if (/close/i.test(value)) this.shouldKeepAlive = false;
+        if (/close/i.test(value)) this.connectionClose = true;
+        if (/keep-alive/i.test(value)) this.connectionKeepAlive = true;
         if (/upgrade/i.test(value)) this.upgrade = true;
       } else if (lname === 'upgrade') {
         this.upgrade = true;
       }
     }
     if (this.currentHeaders.versionMajor === 1 && this.currentHeaders.versionMinor === 0) {
+      this.shouldKeepAlive = this.connectionKeepAlive && !this.connectionClose;
+    } else if (this.connectionClose) {
       this.shouldKeepAlive = false;
     }
     this.currentHeaders.upgrade = this.upgrade;

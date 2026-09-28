@@ -175,7 +175,7 @@ export const jsExecCommand: Command = {
       code = stdinText;
     } else if (parsed.file !== null) {
       try {
-        code = await ctx.fs.readFile(parsed.file);
+        code = await ctx.fs.readFile(ctx.fs.resolvePath(ctx.cwd, parsed.file));
       } catch (e) {
         return {
           stdout: "",

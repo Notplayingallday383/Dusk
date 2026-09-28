@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { worldSource } from './vite-world-source';
+import { nativeWorkerWithoutHmr } from './vite-native-worker-hmr';
 import pkg from './package.json';
+
+const projectRoot = dirname(fileURLToPath(import.meta.url));
 
 // DuskJS requires cross-origin isolation for SharedArrayBuffer. Both the
 // dev server (`vite dev`) and the preview server (`vite preview`, which
@@ -27,16 +32,19 @@ const crossOriginIsolation = {
 };
 
 export default defineConfig({
-  plugins: [crossOriginIsolation, worldSource()],
+  plugins: [crossOriginIsolation, nativeWorkerWithoutHmr(), worldSource()],
   worker: { format: 'es' },
   optimizeDeps: { exclude: ['libcurl.js'] },
-  server: { allowedHosts: ['ddxdevtemp.ampscat.dev'] },
+  server: {
+    allowedHosts: ['ddxdevtemp.ampscat.dev', 'laptop'],
+    fs: { allow: [projectRoot] },
+  },
   // `npm run preview` serves the built dist/ on port 5173 with COOP/COEP.
   preview: {
     port: 5173,
     strictPort: true,
     host: true,
-    allowedHosts: ['ddxdevtemp.ampscat.dev'],
+    allowedHosts: ['ddxdevtemp.ampscat.dev', 'laptop'],
   },
   define: {
     __DUSK_VERSION__: JSON.stringify(pkg.version),
