@@ -43,7 +43,7 @@
     "preview": "vite preview",
     "serve": "npm run build && npm run preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node --test test/source-boundary.test.mjs && vitest run",
     "verify:release": "npm test && npm run typecheck && node scripts/verify-release.mjs",
     "prepublishOnly": "npm run verify:release"
   },
